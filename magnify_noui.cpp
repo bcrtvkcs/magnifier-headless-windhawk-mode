@@ -2,7 +2,7 @@
 // @id              magnifier-headless-mode
 // @name            Magnifier Headless Mode
 // @description     Blocks all Magnifier window creation, keeping only zoom functionality
-// @version         1.0
+// @version         0.1.1
 // @author          BCRTVKCS
 // @github          bcrtvkcs
 // @twitter         bcrtvkcs
