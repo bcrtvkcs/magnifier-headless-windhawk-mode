@@ -13,6 +13,7 @@
 // ==/WindhawkMod==
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 // Hook CreateWindowExW to block all window creation
 using CreateWindowExW_t = decltype(&CreateWindowExW);
@@ -200,6 +201,30 @@ HWND WINAPI SetFocus_Hook(HWND hWnd) {
     return NULL;
 }
 
+// Hide or destroy any windows that might have been created before hooks were set
+BOOL CALLBACK HideWindowEnumProc(HWND hWnd, LPARAM lParam) {
+    ShowWindow(hWnd, SW_HIDE);
+    DestroyWindow(hWnd);
+    return TRUE;
+}
+
+void HideExistingProcessWindows() {
+    DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID == pid) {
+                    EnumThreadWindows(te.th32ThreadID, HideWindowEnumProc, 0);
+                }
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+    }
+}
+
 BOOL Wh_ModInit() {
     // Hook window creation
     Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original);
@@ -222,7 +247,10 @@ BOOL Wh_ModInit() {
     Wh_SetFunctionHook((void*)SetForegroundWindow, (void*)SetForegroundWindow_Hook, (void**)&SetForegroundWindow_Original);
     Wh_SetFunctionHook((void*)SetActiveWindow, (void*)SetActiveWindow_Hook, (void**)&SetActiveWindow_Original);
     Wh_SetFunctionHook((void*)SetFocus, (void*)SetFocus_Hook, (void**)&SetFocus_Original);
-    
+
+    // Hide or destroy any windows that were created before hooks were installed
+    HideExistingProcessWindows();
+
     return TRUE;
 }
 
