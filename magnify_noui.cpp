@@ -11,6 +11,12 @@
 // @exclude         ^(?!.*magnify.exe)
 // ==/WindhawkMod==
 
+// ==WindhawkModReadme==
+/*
+Blocks all Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
+*/
+// ==/WindhawkModReadme==
+
 #include <windows.h>
 
 // Simple function to hide magnifier windows by exact title match only
