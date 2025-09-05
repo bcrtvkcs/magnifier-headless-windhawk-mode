@@ -14,6 +14,8 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <vector>
+#include <mutex>
 
 // Define MAGNIFY_DISABLE_DRAWING_HOOKS to skip UpdateWindow/RedrawWindow/InvalidateRect hooks
 
@@ -21,33 +23,33 @@
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original;
 
-HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName, 
+// Track dummy windows for cleanup
+static std::vector<HWND> g_dummyWindows;
+static std::mutex g_dummyWindowsMutex;
+
+HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName,
                                 LPCWSTR lpWindowName, DWORD dwStyle,
                                 int X, int Y, int nWidth, int nHeight,
-                                HWND hWndParent, HMENU hMenu, 
+                                HWND hWndParent, HMENU hMenu,
                                 HINSTANCE hInstance, LPVOID lpParam) {
-    
+
     // Block ALL window creation for magnifier
-    // Return a dummy invisible window handle to prevent crashes
-    static HWND dummyWindow = NULL;
-    
-    if (!dummyWindow) {
-        // Create one hidden dummy window that magnifier can reference
-        dummyWindow = CreateWindowExW_Original(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            L"Static", 
-            L"", 
-            WS_POPUP,
-            -32000, -32000, 1, 1,  // Off-screen position
-            NULL, NULL, hInstance, NULL
-        );
-        
-        if (dummyWindow) {
-            ShowWindow(dummyWindow, SW_HIDE);
-        }
+    // Create a hidden dummy window for each request
+    HWND dummyWindow = CreateWindowExW_Original(
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        L"Static",
+        L"",
+        WS_POPUP,
+        -32000, -32000, 1, 1,  // Off-screen position
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (dummyWindow) {
+        ShowWindow(dummyWindow, SW_HIDE);
+        std::lock_guard<std::mutex> lock(g_dummyWindowsMutex);
+        g_dummyWindows.push_back(dummyWindow);
     }
-    
-    // Return the same dummy window for all creation requests
+
     return dummyWindow;
 }
 
@@ -60,25 +62,23 @@ HWND WINAPI CreateWindowExA_Hook(DWORD dwExStyle, LPCSTR lpClassName,
                                 int X, int Y, int nWidth, int nHeight,
                                 HWND hWndParent, HMENU hMenu,
                                 HINSTANCE hInstance, LPVOID lpParam) {
-    
+
     // Same logic for ANSI version
-    static HWND dummyWindow = NULL;
-    
-    if (!dummyWindow) {
-        dummyWindow = CreateWindowExA_Original(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            "Static",
-            "",
-            WS_POPUP,
-            -32000, -32000, 1, 1,
-            NULL, NULL, hInstance, NULL
-        );
-        
-        if (dummyWindow) {
-            ShowWindow(dummyWindow, SW_HIDE);
-        }
+    HWND dummyWindow = CreateWindowExA_Original(
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        "Static",
+        "",
+        WS_POPUP,
+        -32000, -32000, 1, 1,
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (dummyWindow) {
+        ShowWindow(dummyWindow, SW_HIDE);
+        std::lock_guard<std::mutex> lock(g_dummyWindowsMutex);
+        g_dummyWindows.push_back(dummyWindow);
     }
-    
+
     return dummyWindow;
 }
 
@@ -298,5 +298,11 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
-    // Cleanup handled by Windhawk
+    std::lock_guard<std::mutex> lock(g_dummyWindowsMutex);
+    for (HWND hWnd : g_dummyWindows) {
+        if (IsWindow(hWnd)) {
+            DestroyWindow(hWnd);
+        }
+    }
+    g_dummyWindows.clear();
 }
