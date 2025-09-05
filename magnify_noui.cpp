@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+// Define MAGNIFY_DISABLE_DRAWING_HOOKS to skip UpdateWindow/RedrawWindow/InvalidateRect hooks
+
 // Hook CreateWindowExW to block all window creation
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original;
@@ -147,32 +149,56 @@ LONG WINAPI SetWindowLongA_Hook(HWND hWnd, int nIndex, LONG dwNewLong) {
     return SetWindowLongA_Original(hWnd, nIndex, dwNewLong);
 }
 
-// Hook UpdateWindow to prevent window updates
+#ifndef MAGNIFY_DISABLE_DRAWING_HOOKS
+
+// Helper to determine whether a window belongs to the magnifier process
+static bool IsMagnifierUiWindow(HWND hWnd) {
+    if (!hWnd) {
+        return false;
+    }
+
+    DWORD pid;
+    GetWindowThreadProcessId(hWnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+// Hook UpdateWindow to prevent window updates for magnifier UI windows only
 using UpdateWindow_t = decltype(&UpdateWindow);
 UpdateWindow_t UpdateWindow_Original;
 
 BOOL WINAPI UpdateWindow_Hook(HWND hWnd) {
-    // Don't update any windows - just return success
+    if (!IsMagnifierUiWindow(hWnd)) {
+        return UpdateWindow_Original(hWnd);
+    }
+
     return TRUE;
 }
 
-// Hook RedrawWindow to prevent redraws
+// Hook RedrawWindow to prevent redraws for magnifier UI windows only
 using RedrawWindow_t = decltype(&RedrawWindow);
 RedrawWindow_t RedrawWindow_Original;
 
 BOOL WINAPI RedrawWindow_Hook(HWND hWnd, CONST RECT *lprcUpdate, HRGN hrgnUpdate, UINT flags) {
-    // Don't redraw - just return success
+    if (!IsMagnifierUiWindow(hWnd)) {
+        return RedrawWindow_Original(hWnd, lprcUpdate, hrgnUpdate, flags);
+    }
+
     return TRUE;
 }
 
-// Hook InvalidateRect to prevent invalidation
+// Hook InvalidateRect to prevent invalidation for magnifier UI windows only
 using InvalidateRect_t = decltype(&InvalidateRect);
 InvalidateRect_t InvalidateRect_Original;
 
 BOOL WINAPI InvalidateRect_Hook(HWND hWnd, CONST RECT *lpRect, BOOL bErase) {
-    // Don't invalidate - just return success
+    if (!IsMagnifierUiWindow(hWnd)) {
+        return InvalidateRect_Original(hWnd, lpRect, bErase);
+    }
+
     return TRUE;
 }
+
+#endif // MAGNIFY_DISABLE_DRAWING_HOOKS
 
 // Hook SetForegroundWindow to prevent window activation
 using SetForegroundWindow_t = decltype(&SetForegroundWindow);
@@ -252,11 +278,13 @@ BOOL Wh_ModInit() {
     // Hook window properties
     Wh_SetFunctionHook((void*)SetWindowLongW, (void*)SetWindowLongW_Hook, (void**)&SetWindowLongW_Original);
     Wh_SetFunctionHook((void*)SetWindowLongA, (void*)SetWindowLongA_Hook, (void**)&SetWindowLongA_Original);
-    
+
+#ifndef MAGNIFY_DISABLE_DRAWING_HOOKS
     // Hook window drawing
     Wh_SetFunctionHook((void*)UpdateWindow, (void*)UpdateWindow_Hook, (void**)&UpdateWindow_Original);
     Wh_SetFunctionHook((void*)RedrawWindow, (void*)RedrawWindow_Hook, (void**)&RedrawWindow_Original);
     Wh_SetFunctionHook((void*)InvalidateRect, (void*)InvalidateRect_Hook, (void**)&InvalidateRect_Original);
+#endif
     
     // Hook window activation
     Wh_SetFunctionHook((void*)SetForegroundWindow, (void*)SetForegroundWindow_Hook, (void**)&SetForegroundWindow_Original);
