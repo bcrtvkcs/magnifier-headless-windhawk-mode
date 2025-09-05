@@ -178,8 +178,13 @@ using SetForegroundWindow_t = decltype(&SetForegroundWindow);
 SetForegroundWindow_t SetForegroundWindow_Original;
 
 BOOL WINAPI SetForegroundWindow_Hook(HWND hWnd) {
-    // Never bring magnifier windows to foreground
-    return TRUE;
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hWnd, &processId);
+    if (processId == GetCurrentProcessId()) {
+        // Suppress activation for magnifier windows
+        return TRUE;
+    }
+    return SetForegroundWindow_Original(hWnd);
 }
 
 // Hook SetActiveWindow 
@@ -187,8 +192,13 @@ using SetActiveWindow_t = decltype(&SetActiveWindow);
 SetActiveWindow_t SetActiveWindow_Original;
 
 HWND WINAPI SetActiveWindow_Hook(HWND hWnd) {
-    // Never activate magnifier windows
-    return NULL;
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hWnd, &processId);
+    if (processId == GetCurrentProcessId()) {
+        // Suppress activation for magnifier windows
+        return NULL;
+    }
+    return SetActiveWindow_Original(hWnd);
 }
 
 // Hook SetFocus
@@ -196,8 +206,13 @@ using SetFocus_t = decltype(&SetFocus);
 SetFocus_t SetFocus_Original;
 
 HWND WINAPI SetFocus_Hook(HWND hWnd) {
-    // Never focus magnifier windows
-    return NULL;
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hWnd, &processId);
+    if (processId == GetCurrentProcessId()) {
+        // Suppress focusing for magnifier windows
+        return NULL;
+    }
+    return SetFocus_Original(hWnd);
 }
 
 BOOL Wh_ModInit() {
