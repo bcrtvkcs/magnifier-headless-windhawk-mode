@@ -99,18 +99,15 @@ void HideMagnifierWindows() {
     
     for (int i = 0; i < sizeof(titles) / sizeof(titles[0]); i++) {
         HWND hwnd = NULL;
-        do {
-            hwnd = FindWindowW(NULL, titles[i]);
-            if (hwnd) {
-                ShowWindow(hwnd, SW_HIDE);
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, 
-                    GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TRANSPARENT);
-                SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
-                
-                BOOL cloak = TRUE;
-                DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
-            }
-        } while (hwnd);
+        while ((hwnd = FindWindowExW(NULL, hwnd, NULL, titles[i])) != NULL) {
+            ShowWindow(hwnd, SW_HIDE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TRANSPARENT);
+            SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+
+            BOOL cloak = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+        }
     }
 }
 
