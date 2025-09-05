@@ -1,3 +1,4 @@
 Magnifier Headless Mode
 
-Blocks all Magnifier window creation, keeping only zoom functionality
+Windhawk mod that hides the Magnifier user interface window
+named "Büyüteç", leaving only the zoom functionality active.
