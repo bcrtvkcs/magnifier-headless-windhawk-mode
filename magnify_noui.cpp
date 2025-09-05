@@ -4,8 +4,8 @@
 // @description     Blocks all Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
 // @version         0.1.0
 // @author          BCRTVKCS
-// @github          bcrtvkcs
-// @twitter         bcrtvkcs
+// @github          https://github.com/bcrtvkcs
+// @twitter         https://x.com/bcrtvkcs
 // @homepage        https://grdigital.pro
 // @include         magnify.exe
 // @exclude         ^(?!.*magnify.exe)
