@@ -19,6 +19,40 @@
 
 // Define MAGNIFY_DISABLE_DRAWING_HOOKS to skip UpdateWindow/RedrawWindow/InvalidateRect hooks
 
+// Helper to determine whether a window belongs to the Magnifier UI.
+// A window is considered part of the Magnifier UI if it belongs to the
+// magnifier process itself or if its class name matches known magnifier
+// class names.
+static bool IsMagnifierUiWindow(HWND hWnd) {
+    if (!hWnd) {
+        return false;
+    }
+
+    // Check if the window belongs to the current (magnifier) process.
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid == GetCurrentProcessId()) {
+        return true;
+    }
+
+    // Check for known magnifier-related class names.
+    wchar_t className[256];
+    if (GetClassNameW(hWnd, className, sizeof(className) / sizeof(className[0]))) {
+        static const wchar_t *kMagnifierClassNames[] = {
+            L"MagnifierWindowClass",
+            L"FullScreenMagnifier",
+            L"FullScreenMagnifierWndClass",
+        };
+        for (const auto &knownClass : kMagnifierClassNames) {
+            if (lstrcmpiW(className, knownClass) == 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 // Hook CreateWindowExW to block all window creation
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original;
@@ -101,11 +135,16 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t SetWindowPos_Original;
 
-BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y, 
+BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y,
                              int cx, int cy, UINT uFlags) {
-    // Force all windows to be hidden and off-screen
-    return SetWindowPos_Original(hWnd, HWND_BOTTOM, -32000, -32000, 
-                                1, 1, SWP_HIDEWINDOW | SWP_NOACTIVATE);
+    if (IsMagnifierUiWindow(hWnd)) {
+        // Force magnifier UI windows off-screen and hidden
+        return SetWindowPos_Original(hWnd, HWND_BOTTOM, -32000, -32000,
+                                     1, 1, SWP_HIDEWINDOW | SWP_NOACTIVATE);
+    }
+
+    // For non-magnifier windows, use the original parameters
+    return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
 }
 
 // Hook SetWindowLongW to prevent window property changes that might show windows
@@ -150,17 +189,6 @@ LONG WINAPI SetWindowLongA_Hook(HWND hWnd, int nIndex, LONG dwNewLong) {
 }
 
 #ifndef MAGNIFY_DISABLE_DRAWING_HOOKS
-
-// Helper to determine whether a window belongs to the magnifier process
-static bool IsMagnifierUiWindow(HWND hWnd) {
-    if (!hWnd) {
-        return false;
-    }
-
-    DWORD pid;
-    GetWindowThreadProcessId(hWnd, &pid);
-    return pid == GetCurrentProcessId();
-}
 
 // Hook UpdateWindow to prevent window updates for magnifier UI windows only
 using UpdateWindow_t = decltype(&UpdateWindow);
