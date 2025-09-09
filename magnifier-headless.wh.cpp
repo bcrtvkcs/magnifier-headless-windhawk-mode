@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
-// @description     Blocks all Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
+// @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
 // @version         0.2.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
@@ -12,7 +12,7 @@
 
 // ==WindhawkModReadme==
 /*
-Blocks all Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
+Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
 */
 // ==/WindhawkModReadme==
 
