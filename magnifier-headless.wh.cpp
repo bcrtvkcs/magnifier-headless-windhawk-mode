@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.1.0
+// @version         1.2.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -70,6 +70,16 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
 - LRU cache eviction for optimal memory usage
 - Conditional logging to minimize overhead
 - Optimized critical section usage with double-check locking
+
+## Error Handling & Robustness
+- Structured Exception Handling (SEH) for all critical operations
+- Safe wrapper functions for Windows API calls with validation
+- Comprehensive null pointer and window handle validation
+- Automatic retry mechanism for recoverable errors (up to 3 attempts)
+- Detailed error logging with error codes and exception information
+- Graceful fallbacks for non-critical failures
+- Thread-safe error recovery in multi-threaded scenarios
+- Defensive programming with bounds checking and parameter validation
 */
 // ==/WindhawkModReadme==
 
@@ -108,6 +118,12 @@ int g_cacheIndex = 0;
 // Performance: Suppress high-frequency message logs
 #define LOG_HIGH_FREQ_MESSAGES FALSE
 
+// Error handling: Enable detailed error logging
+#define LOG_ERROR_DETAILS TRUE
+
+// Error handling: Maximum retry attempts for recoverable errors
+#define MAX_RETRY_ATTEMPTS 3
+
 // Window procedure hook handle
 HHOOK g_hCallWndProcHook = NULL;
 
@@ -133,6 +149,120 @@ public:
         }
     }
 };
+
+// --- ERROR HANDLING HELPERS ---
+
+// Safe window validation with comprehensive checks
+inline BOOL SafeIsWindow(HWND hwnd) {
+    if (!hwnd) {
+        return FALSE;
+    }
+
+    __try {
+        return IsWindow(hwnd);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (LOG_ERROR_DETAILS) {
+            Wh_Log(L"Magnifier Headless: Exception in SafeIsWindow for HWND 0x%p (code: 0x%X)",
+                   hwnd, GetExceptionCode());
+        }
+        return FALSE;
+    }
+}
+
+// Safe GetClassNameW with error handling
+inline BOOL SafeGetClassName(HWND hwnd, LPWSTR lpClassName, int nMaxCount) {
+    if (!hwnd || !lpClassName || nMaxCount <= 0) {
+        return FALSE;
+    }
+
+    __try {
+        int result = GetClassNameW(hwnd, lpClassName, nMaxCount);
+        if (result == 0) {
+            DWORD dwError = GetLastError();
+            if (LOG_ERROR_DETAILS && dwError != ERROR_SUCCESS) {
+                Wh_Log(L"Magnifier Headless: GetClassNameW failed for HWND 0x%p (error: %lu)", hwnd, dwError);
+            }
+            return FALSE;
+        }
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (LOG_ERROR_DETAILS) {
+            Wh_Log(L"Magnifier Headless: Exception in SafeGetClassName for HWND 0x%p (code: 0x%X)",
+                   hwnd, GetExceptionCode());
+        }
+        return FALSE;
+    }
+}
+
+// Safe SetWindowLongPtrW with validation
+inline LONG_PTR SafeSetWindowLongPtrW(HWND hwnd, int nIndex, LONG_PTR dwNewLong) {
+    if (!SafeIsWindow(hwnd)) {
+        return 0;
+    }
+
+    __try {
+        SetLastError(0);
+        LONG_PTR result = SetWindowLongPtrW(hwnd, nIndex, dwNewLong);
+        DWORD dwError = GetLastError();
+
+        if (result == 0 && dwError != ERROR_SUCCESS) {
+            if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: SetWindowLongPtrW failed for HWND 0x%p, index %d (error: %lu)",
+                       hwnd, nIndex, dwError);
+            }
+        }
+        return result;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (LOG_ERROR_DETAILS) {
+            Wh_Log(L"Magnifier Headless: Exception in SafeSetWindowLongPtrW for HWND 0x%p (code: 0x%X)",
+                   hwnd, GetExceptionCode());
+        }
+        return 0;
+    }
+}
+
+// Safe SetParent with validation and retry
+inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
+    if (!SafeIsWindow(hWndChild)) {
+        return NULL;
+    }
+
+    for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+        __try {
+            SetLastError(0);
+            HWND result = SetParent(hWndChild, hWndNewParent);
+            DWORD dwError = GetLastError();
+
+            if (result || dwError == ERROR_SUCCESS) {
+                return result;
+            }
+
+            if (LOG_ERROR_DETAILS && attempt == MAX_RETRY_ATTEMPTS - 1) {
+                Wh_Log(L"Magnifier Headless: SetParent failed after %d attempts for HWND 0x%p (error: %lu)",
+                       MAX_RETRY_ATTEMPTS, hWndChild, dwError);
+            }
+
+            // Brief sleep before retry
+            if (attempt < MAX_RETRY_ATTEMPTS - 1) {
+                Sleep(10);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: Exception in SafeSetParent attempt %d for HWND 0x%p (code: 0x%X)",
+                       attempt + 1, hWndChild, GetExceptionCode());
+            }
+            if (attempt == MAX_RETRY_ATTEMPTS - 1) {
+                return NULL;
+            }
+        }
+    }
+
+    return NULL;
+}
 
 // Optimized inline function to check if a window is the Magnifier window
 inline BOOL IsMagnifierWindow(HWND hwnd) {
@@ -164,7 +294,7 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
 
     // Slow path: Not in cache, check class name
     wchar_t className[32] = {0}; // Reduced size for performance
-    if (!GetClassNameW(hwnd, className, 32)) {
+    if (!SafeGetClassName(hwnd, className, 32)) {
         return FALSE;
     }
 
@@ -359,10 +489,16 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd, DWORD dwAttribute, LPCVOID 
 
 // --- WINDOW PROCEDURE HOOK ---
 
-// Subclassed window procedure for Magnifier window (optimized)
+// Subclassed window procedure for Magnifier window (optimized with error handling)
 LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    // Fast path: Handle high-frequency messages without logging
-    switch (uMsg) {
+    __try {
+        // Validate window handle
+        if (!SafeIsWindow(hWnd)) {
+            return 0;
+        }
+
+        // Fast path: Handle high-frequency messages without logging
+        switch (uMsg) {
         case WM_PAINT:
         case WM_ERASEBKGND:
             // Suppress painting (no log for performance)
@@ -430,36 +566,73 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                 return 0;
             }
             break;
-    }
+        }
 
-    // Call original window procedure for unhandled messages
-    return g_OriginalMagnifierWndProc ? CallWindowProcW(g_OriginalMagnifierWndProc, hWnd, uMsg, wParam, lParam) : DefWindowProcW(hWnd, uMsg, wParam, lParam);
+        // Call original window procedure for unhandled messages
+        if (g_OriginalMagnifierWndProc) {
+            return CallWindowProcW(g_OriginalMagnifierWndProc, hWnd, uMsg, wParam, lParam);
+        }
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (LOG_ERROR_DETAILS) {
+            Wh_Log(L"Magnifier Headless: Exception in MagnifierWndProc_Hook for message 0x%X (code: 0x%X)",
+                   uMsg, GetExceptionCode());
+        }
+        // Graceful fallback
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
 }
 
-// CallWndProc hook to detect and subclass Magnifier windows (optimized)
+// CallWndProc hook to detect and subclass Magnifier windows (optimized with error handling)
 LRESULT CALLBACK CallWndProc_Hook(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_lInitialized) {
-        CWPSTRUCT* pCwp = (CWPSTRUCT*)lParam;
+    __try {
+        if (nCode >= 0 && g_lInitialized) {
+            // Validate lParam
+            if (!lParam) {
+                return CallNextHookEx(g_hCallWndProcHook, nCode, wParam, lParam);
+            }
 
-        if (pCwp && IsMagnifierWindow(pCwp->hwnd)) {
-            // Fast path: Check if already subclassed without lock
-            if (g_hSubclassedMagnifierWnd != pCwp->hwnd) {
-                WNDPROC currentProc = (WNDPROC)GetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC);
-                if (currentProc != MagnifierWndProc_Hook && currentProc != NULL) {
-                    // Thread-safe subclassing
-                    {
-                        AutoCriticalSection lock(&g_csGlobalState);
-                        // Double-check after acquiring lock
-                        if (g_hSubclassedMagnifierWnd != pCwp->hwnd) {
-                            g_OriginalMagnifierWndProc = currentProc;
-                            g_hSubclassedMagnifierWnd = pCwp->hwnd;
+            CWPSTRUCT* pCwp = (CWPSTRUCT*)lParam;
+
+            // Validate CWPSTRUCT and window handle
+            if (pCwp && SafeIsWindow(pCwp->hwnd) && IsMagnifierWindow(pCwp->hwnd)) {
+                // Fast path: Check if already subclassed without lock
+                if (g_hSubclassedMagnifierWnd != pCwp->hwnd) {
+                    SetLastError(0);
+                    WNDPROC currentProc = (WNDPROC)GetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC);
+                    DWORD dwError = GetLastError();
+
+                    if (currentProc != MagnifierWndProc_Hook && currentProc != NULL) {
+                        // Thread-safe subclassing
+                        {
+                            AutoCriticalSection lock(&g_csGlobalState);
+                            // Double-check after acquiring lock
+                            if (g_hSubclassedMagnifierWnd != pCwp->hwnd) {
+                                g_OriginalMagnifierWndProc = currentProc;
+                                g_hSubclassedMagnifierWnd = pCwp->hwnd;
+                            }
+                        }
+
+                        // Attempt subclassing with error checking
+                        SetLastError(0);
+                        LONG_PTR result = SafeSetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC, (LONG_PTR)MagnifierWndProc_Hook);
+                        dwError = GetLastError();
+
+                        if (result != 0 || dwError == ERROR_SUCCESS) {
+                            Wh_Log(L"Magnifier Headless: Subclassed Magnifier window (HWND: 0x%p)", pCwp->hwnd);
+                        } else if (LOG_ERROR_DETAILS) {
+                            Wh_Log(L"Magnifier Headless: Failed to subclass window (HWND: 0x%p, error: %lu)",
+                                   pCwp->hwnd, dwError);
                         }
                     }
-
-                    SetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC, (LONG_PTR)MagnifierWndProc_Hook);
-                    Wh_Log(L"Magnifier Headless: Subclassed Magnifier window (HWND: 0x%p)", pCwp->hwnd);
                 }
             }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (LOG_ERROR_DETAILS) {
+            Wh_Log(L"Magnifier Headless: Exception in CallWndProc_Hook (code: 0x%X)", GetExceptionCode());
         }
     }
 
@@ -496,18 +669,33 @@ HWND WINAPI CreateWindowExW_Hook(
                                   nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 
     if (hwnd && isMagnifierClass) {
-        // Fast path: Read g_hHostWnd without lock (it's stable after init)
-        HWND hostWnd = g_hHostWnd;
-        if (hostWnd) {
-            SetParent(hwnd, hostWnd);
+        __try {
+            // Fast path: Read g_hHostWnd without lock (it's stable after init)
+            HWND hostWnd = g_hHostWnd;
+            if (hostWnd && SafeIsWindow(hostWnd)) {
+                SafeSetParent(hwnd, hostWnd);
+            }
+
+            // Hide window with safety check
+            if (ShowWindow_Original && SafeIsWindow(hwnd)) {
+                ShowWindow_Original(hwnd, SW_HIDE);
+            }
+
+            // Force update styles with safe API
+            if (SetWindowLongPtrW_Original && SafeIsWindow(hwnd)) {
+                LONG_PTR currentStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SafeSetWindowLongPtrW(hwnd, GWL_STYLE, currentStyle & ~WS_VISIBLE);
+
+                LONG_PTR currentExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SafeSetWindowLongPtrW(hwnd, GWL_EXSTYLE, (currentExStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+            }
         }
-
-        ShowWindow_Original(hwnd, SW_HIDE);
-
-        // Force update styles
-        SetWindowLongPtrW_Original(hwnd, GWL_STYLE, GetWindowLongPtrW(hwnd, GWL_STYLE) & ~WS_VISIBLE);
-        SetWindowLongPtrW_Original(hwnd, GWL_EXSTYLE,
-            (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: Exception in CreateWindowExW post-creation handling (code: 0x%X)",
+                       GetExceptionCode());
+            }
+        }
     }
 
     return hwnd;
@@ -664,9 +852,24 @@ void Wh_ModUninit() {
         g_OriginalMagnifierWndProc = NULL;
     }
 
-    if (hSubclassedWnd && IsWindow(hSubclassedWnd) && originalProc) {
-        SetWindowLongPtrW(hSubclassedWnd, GWLP_WNDPROC, (LONG_PTR)originalProc);
-        Wh_Log(L"Magnifier Headless: Restored original WndProc for HWND 0x%p", hSubclassedWnd);
+    if (hSubclassedWnd && SafeIsWindow(hSubclassedWnd) && originalProc) {
+        __try {
+            SetLastError(0);
+            LONG_PTR result = SafeSetWindowLongPtrW(hSubclassedWnd, GWLP_WNDPROC, (LONG_PTR)originalProc);
+            DWORD dwError = GetLastError();
+
+            if (result != 0 || dwError == ERROR_SUCCESS) {
+                Wh_Log(L"Magnifier Headless: Restored original WndProc for HWND 0x%p", hSubclassedWnd);
+            } else if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: Failed to restore WndProc for HWND 0x%p (error: %lu)",
+                       hSubclassedWnd, dwError);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: Exception restoring WndProc (code: 0x%X)", GetExceptionCode());
+            }
+        }
     }
 
     // Thread-safe cleanup
@@ -684,9 +887,19 @@ void Wh_ModUninit() {
         g_cacheIndex = 0;
     }
 
-    if (hHostWnd) {
-        DestroyWindow(hHostWnd);
-        Wh_Log(L"Magnifier Headless: Host window destroyed.");
+    if (hHostWnd && SafeIsWindow(hHostWnd)) {
+        __try {
+            if (DestroyWindow(hHostWnd)) {
+                Wh_Log(L"Magnifier Headless: Host window destroyed.");
+            } else if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: Failed to destroy host window (error: %lu)", GetLastError());
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (LOG_ERROR_DETAILS) {
+                Wh_Log(L"Magnifier Headless: Exception destroying host window (code: 0x%X)", GetExceptionCode());
+            }
+        }
     }
 
     // Cleanup critical section
