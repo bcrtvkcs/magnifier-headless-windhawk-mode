@@ -17,15 +17,15 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 
 ## Technical Details
 
-**Version**: 1.4.0
+**Version**: 1.3.2
 
-**Latest Changes (v1.4.0)**:
-- **CRITICAL FIX**: Preserve MagUIClass (functional window needed for zoom to work)
-- **UI-ONLY HIDING**: Only hide UI windows (ScreenMagnifierUIWnd, GDI+, CspNotify, Magnifier Touch)
-- **REMOVED DestroyWindow()**: No longer destroying windows (was breaking zoom functionality)
-- **FUNCTIONAL PRESERVATION**: Hooks, timer, and subclassing now ignore MagUIClass
-- EnumWindows-based cleanup still active (1ms timer, full system scan)
-- Mouse freeze eliminated - initialization no longer blocks
+**Latest Changes (v1.3.2)**:
+- **NUCLEAR OPTION**: DestroyWindow() now called on all Magnifier windows (aggressive removal)
+- **WILDCARD SEARCH**: Using wcsstr() instead of exact match (catches variations like "GDI+ Window Class")
+- **FULL SYSTEM SCAN**: EnumWindows instead of FindWindowExW (scans ALL windows, not just by class)
+- **1ms TIMER**: Ultra-aggressive 1ms cleanup interval (1000 checks/second)
+- **DEBUG LOGGING**: First 20 cleanup passes logged for troubleshooting
+- Removed g_lInitialized check from timer (runs immediately on start)
 
 **Previous Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
