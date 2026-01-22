@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.3.1
+// @version         1.3.2
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -270,6 +270,16 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     } else if (wcsstr(className, L"MSCTFIME") != NULL) {
         // MSCTFIME UI (Input Method Editor helper window)
         isMagnifier = TRUE;
+    }
+
+    // If not detected by class name, check window title for touch controls
+    if (!isMagnifier) {
+        wchar_t windowTitle[64] = {0};
+        if (GetWindowTextW(hwnd, windowTitle, 64) > 0) {
+            if (wcsstr(windowTitle, L"Magnifier Touch") != NULL) {
+                isMagnifier = TRUE;
+            }
+        }
     }
 
     // Add to cache with LRU eviction (thread-safe)
@@ -617,6 +627,15 @@ HWND WINAPI CreateWindowExW_Hook(
             dwExStyle |= WS_EX_TOOLWINDOW;
             Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation (class: %ls)", lpClassName);
         }
+    }
+
+    // Also check window title for "Magnifier Touch" controls
+    if (!isMagnifierClass && lpWindowName && wcsstr(lpWindowName, L"Magnifier Touch") != NULL) {
+        isMagnifierClass = TRUE;
+        dwStyle &= ~WS_VISIBLE;
+        dwExStyle &= ~WS_EX_APPWINDOW;
+        dwExStyle |= WS_EX_TOOLWINDOW;
+        Wh_Log(L"Magnifier Headless: Intercepting Magnifier Touch window (title: %ls)", lpWindowName);
     }
 
     HWND hwnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y,
