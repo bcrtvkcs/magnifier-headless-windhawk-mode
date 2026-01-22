@@ -17,9 +17,14 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 
 ## Technical Details
 
-**Version**: 1.2.0
+**Version**: 1.2.1
 
-**Improvements**:
+**Latest Changes (v1.2.1)**:
+- Fixed missing window class detection: Now hides "GDI+ Window" and "CspNotify Notify Window"
+- Reduced mouse freeze on first launch: Optimized retry delays from 10ms to 1ms
+- Improved logging for better troubleshooting
+
+**Previous Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
 - 11 API hooks for complete window visibility control
 - Window procedure interception for message-level blocking
