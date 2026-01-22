@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.0.0
+// @version         1.1.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -58,9 +58,18 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
 ## Technical Implementation
 - Uses CRITICAL_SECTION for thread-safe global state management
 - Atomic operations (InterlockedExchange) for initialization flags
-- Circular buffer cache for fast window detection
+- LRU cache (16 entries) with fast window detection and eviction strategy
 - RAII pattern (AutoCriticalSection) for safe lock management
 - Proper hook ordering to prevent race conditions
+
+## Performance Optimizations
+- Process ID fast-path filtering to skip non-Magnifier windows instantly
+- Inline IsMagnifierWindow with optimized string comparison (first character check)
+- High-frequency message suppression (WM_PAINT, WM_TIMER, WM_NCHITTEST)
+- Reduced atomic operation overhead (simple read instead of InterlockedCompareExchange)
+- LRU cache eviction for optimal memory usage
+- Conditional logging to minimize overhead
+- Optimized critical section usage with double-check locking
 */
 // ==/WindhawkModReadme==
 
@@ -84,13 +93,20 @@ volatile HWND g_hHostWnd = NULL;
 // Atomic flag to track initialization status
 volatile LONG g_lInitialized = 0;
 
+// Process ID of magnify.exe for fast filtering
+DWORD g_dwMagnifyProcessId = 0;
+
 // HWND cache for fast magnifier window detection (protected by g_csGlobalState)
-#define MAX_CACHED_MAGNIFIER_WINDOWS 8
+#define MAX_CACHED_MAGNIFIER_WINDOWS 16
 struct {
     HWND hwnd;
     BOOL isMagnifier;
+    DWORD lastAccessTick; // For LRU eviction
 } g_windowCache[MAX_CACHED_MAGNIFIER_WINDOWS] = {0};
 int g_cacheIndex = 0;
+
+// Performance: Suppress high-frequency message logs
+#define LOG_HIGH_FREQ_MESSAGES FALSE
 
 // Window procedure hook handle
 HHOOK g_hCallWndProcHook = NULL;
@@ -118,37 +134,69 @@ public:
     }
 };
 
-// Thread-safe function to check if a window is the Magnifier window
-BOOL IsMagnifierWindow(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd)) {
+// Optimized inline function to check if a window is the Magnifier window
+inline BOOL IsMagnifierWindow(HWND hwnd) {
+    // Fast path: null check
+    if (!hwnd) {
         return FALSE;
     }
 
-    // Check cache first (thread-safe)
+    // Fast path: Process ID check (if available)
+    if (g_dwMagnifyProcessId != 0) {
+        DWORD dwProcessId = 0;
+        GetWindowThreadProcessId(hwnd, &dwProcessId);
+        if (dwProcessId != g_dwMagnifyProcessId) {
+            return FALSE; // Different process, definitely not Magnifier
+        }
+    }
+
+    // Fast path: Check cache first (thread-safe with minimal locking)
+    DWORD currentTick = GetTickCount();
     {
         AutoCriticalSection lock(&g_csGlobalState);
         for (int i = 0; i < MAX_CACHED_MAGNIFIER_WINDOWS; i++) {
             if (g_windowCache[i].hwnd == hwnd) {
+                g_windowCache[i].lastAccessTick = currentTick; // Update LRU
                 return g_windowCache[i].isMagnifier;
             }
         }
     }
 
-    // Not in cache, check class name
-    wchar_t className[256] = {0};
-    if (!GetClassNameW(hwnd, className, sizeof(className)/sizeof(wchar_t))) {
+    // Slow path: Not in cache, check class name
+    wchar_t className[32] = {0}; // Reduced size for performance
+    if (!GetClassNameW(hwnd, className, 32)) {
         return FALSE;
     }
 
-    // Check for known Magnifier class names
-    BOOL isMagnifier = (wcscmp(className, L"MagUIClass") == 0 ||
-                        wcscmp(className, L"ScreenMagnifierUIWnd") == 0);
+    // Optimized string comparison (check first character first)
+    BOOL isMagnifier = FALSE;
+    if (className[0] == L'M' && wcscmp(className, L"MagUIClass") == 0) {
+        isMagnifier = TRUE;
+    } else if (className[0] == L'S' && wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
+        isMagnifier = TRUE;
+    }
 
-    // Add to cache (thread-safe with circular buffer)
+    // Add to cache with LRU eviction (thread-safe)
     {
         AutoCriticalSection lock(&g_csGlobalState);
-        g_windowCache[g_cacheIndex].hwnd = hwnd;
-        g_windowCache[g_cacheIndex].isMagnifier = isMagnifier;
+
+        // Find oldest entry for eviction
+        int oldestIndex = 0;
+        DWORD oldestTick = g_windowCache[0].lastAccessTick;
+        for (int i = 1; i < MAX_CACHED_MAGNIFIER_WINDOWS; i++) {
+            if (g_windowCache[i].lastAccessTick < oldestTick) {
+                oldestTick = g_windowCache[i].lastAccessTick;
+                oldestIndex = i;
+            }
+        }
+
+        // Use circular buffer index or LRU eviction
+        int targetIndex = (g_windowCache[g_cacheIndex].hwnd == NULL) ? g_cacheIndex : oldestIndex;
+
+        g_windowCache[targetIndex].hwnd = hwnd;
+        g_windowCache[targetIndex].isMagnifier = isMagnifier;
+        g_windowCache[targetIndex].lastAccessTick = currentTick;
+
         g_cacheIndex = (g_cacheIndex + 1) % MAX_CACHED_MAGNIFIER_WINDOWS;
     }
 
@@ -161,15 +209,13 @@ BOOL IsMagnifierWindow(HWND hwnd) {
 using ShowWindow_t = decltype(&ShowWindow);
 ShowWindow_t ShowWindow_Original = nullptr;
 BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    // Fast path: Check initialization once
+    if (!g_lInitialized) {
         return ShowWindow_Original ? ShowWindow_Original(hWnd, nCmdShow) : FALSE;
     }
 
     if (IsMagnifierWindow(hWnd) && nCmdShow != SW_HIDE) {
-        // Pretend we showed it, but do nothing
-        Wh_Log(L"Magnifier Headless: Blocked ShowWindow for HWND 0x%p (cmd: %d)", hWnd, nCmdShow);
-        return TRUE;
+        return TRUE; // Pretend success
     }
     return ShowWindow_Original(hWnd, nCmdShow);
 }
@@ -178,18 +224,13 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t SetWindowPos_Original = nullptr;
 BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return SetWindowPos_Original ? SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags) : FALSE;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        UINT originalFlags = uFlags;
-        uFlags &= ~SWP_SHOWWINDOW; // Remove the show flag
-        uFlags |= SWP_HIDEWINDOW;  // Force hide flag
-        if (originalFlags != uFlags) {
-            Wh_Log(L"Magnifier Headless: Modified SetWindowPos flags for HWND 0x%p", hWnd);
-        }
+        uFlags &= ~SWP_SHOWWINDOW;
+        uFlags |= SWP_HIDEWINDOW;
     }
     return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
 }
@@ -198,25 +239,16 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int
 using SetWindowLongPtrW_t = decltype(&SetWindowLongPtrW);
 SetWindowLongPtrW_t SetWindowLongPtrW_Original = nullptr;
 LONG_PTR WINAPI SetWindowLongPtrW_Hook(HWND hWnd, int nIndex, LONG_PTR dwNewLong) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return SetWindowLongPtrW_Original ? SetWindowLongPtrW_Original(hWnd, nIndex, dwNewLong) : 0;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        LONG_PTR originalValue = dwNewLong;
         if (nIndex == GWL_STYLE) {
-            dwNewLong &= ~WS_VISIBLE; // Remove the visible style
-            if (originalValue != dwNewLong) {
-                Wh_Log(L"Magnifier Headless: Removed WS_VISIBLE from style for HWND 0x%p", hWnd);
-            }
-        }
-        if (nIndex == GWL_EXSTYLE) {
-            dwNewLong &= ~WS_EX_APPWINDOW; // Remove the taskbar button style
-            dwNewLong |= WS_EX_TOOLWINDOW;  // Add tool window style (no taskbar)
-            if (originalValue != dwNewLong) {
-                Wh_Log(L"Magnifier Headless: Modified extended style for HWND 0x%p", hWnd);
-            }
+            dwNewLong &= ~WS_VISIBLE;
+        } else if (nIndex == GWL_EXSTYLE) {
+            dwNewLong &= ~WS_EX_APPWINDOW;
+            dwNewLong |= WS_EX_TOOLWINDOW;
         }
     }
     return SetWindowLongPtrW_Original(hWnd, nIndex, dwNewLong);
@@ -230,15 +262,13 @@ BOOL WINAPI UpdateLayeredWindow_Hook(
     HDC hdcSrc, POINT* pptSrc, COLORREF crKey,
     BLENDFUNCTION* pblend, DWORD dwFlags) {
 
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return UpdateLayeredWindow_Original ? UpdateLayeredWindow_Original(hWnd, hdcDst, pptDst, psize,
                                               hdcSrc, pptSrc, crKey, pblend, dwFlags) : FALSE;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        Wh_Log(L"Magnifier Headless: Blocked UpdateLayeredWindow for HWND 0x%p", hWnd);
-        return TRUE; // Pretend it succeeded
+        return TRUE; // Pretend success
     }
     return UpdateLayeredWindow_Original(hWnd, hdcDst, pptDst, psize, hdcSrc, pptSrc, crKey, pblend, dwFlags);
 }
@@ -247,14 +277,12 @@ BOOL WINAPI UpdateLayeredWindow_Hook(
 using SetLayeredWindowAttributes_t = decltype(&SetLayeredWindowAttributes);
 SetLayeredWindowAttributes_t SetLayeredWindowAttributes_Original = nullptr;
 BOOL WINAPI SetLayeredWindowAttributes_Hook(HWND hWnd, COLORREF crKey, BYTE bAlpha, DWORD dwFlags) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return SetLayeredWindowAttributes_Original ? SetLayeredWindowAttributes_Original(hWnd, crKey, bAlpha, dwFlags) : FALSE;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        Wh_Log(L"Magnifier Headless: Blocked SetLayeredWindowAttributes for HWND 0x%p", hWnd);
-        return TRUE; // Pretend it succeeded
+        return TRUE; // Pretend success
     }
     return SetLayeredWindowAttributes_Original(hWnd, crKey, bAlpha, dwFlags);
 }
@@ -263,17 +291,12 @@ BOOL WINAPI SetLayeredWindowAttributes_Hook(HWND hWnd, COLORREF crKey, BYTE bAlp
 using AnimateWindow_t = decltype(&AnimateWindow);
 AnimateWindow_t AnimateWindow_Original = nullptr;
 BOOL WINAPI AnimateWindow_Hook(HWND hWnd, DWORD dwTime, DWORD dwFlags) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return AnimateWindow_Original ? AnimateWindow_Original(hWnd, dwTime, dwFlags) : FALSE;
     }
 
-    if (IsMagnifierWindow(hWnd)) {
-        // Only block if it's trying to show the window
-        if (!(dwFlags & AW_HIDE)) {
-            Wh_Log(L"Magnifier Headless: Blocked AnimateWindow (show) for HWND 0x%p", hWnd);
-            return TRUE; // Pretend it succeeded
-        }
+    if (IsMagnifierWindow(hWnd) && !(dwFlags & AW_HIDE)) {
+        return TRUE; // Block show animations
     }
     return AnimateWindow_Original(hWnd, dwTime, dwFlags);
 }
@@ -282,14 +305,12 @@ BOOL WINAPI AnimateWindow_Hook(HWND hWnd, DWORD dwTime, DWORD dwFlags) {
 using BringWindowToTop_t = decltype(&BringWindowToTop);
 BringWindowToTop_t BringWindowToTop_Original = nullptr;
 BOOL WINAPI BringWindowToTop_Hook(HWND hWnd) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return BringWindowToTop_Original ? BringWindowToTop_Original(hWnd) : FALSE;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        Wh_Log(L"Magnifier Headless: Blocked BringWindowToTop for HWND 0x%p", hWnd);
-        return TRUE; // Pretend it succeeded
+        return TRUE; // Pretend success
     }
     return BringWindowToTop_Original(hWnd);
 }
@@ -298,14 +319,12 @@ BOOL WINAPI BringWindowToTop_Hook(HWND hWnd) {
 using SetForegroundWindow_t = decltype(&SetForegroundWindow);
 SetForegroundWindow_t SetForegroundWindow_Original = nullptr;
 BOOL WINAPI SetForegroundWindow_Hook(HWND hWnd) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return SetForegroundWindow_Original ? SetForegroundWindow_Original(hWnd) : FALSE;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        Wh_Log(L"Magnifier Headless: Blocked SetForegroundWindow for HWND 0x%p", hWnd);
-        return TRUE; // Pretend it succeeded
+        return TRUE; // Pretend success
     }
     return SetForegroundWindow_Original(hWnd);
 }
@@ -314,15 +333,12 @@ BOOL WINAPI SetForegroundWindow_Hook(HWND hWnd) {
 using SetWindowRgn_t = decltype(&SetWindowRgn);
 SetWindowRgn_t SetWindowRgn_Original = nullptr;
 int WINAPI SetWindowRgn_Hook(HWND hWnd, HRGN hRgn, BOOL bRedraw) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return SetWindowRgn_Original ? SetWindowRgn_Original(hWnd, hRgn, bRedraw) : 0;
     }
 
     if (IsMagnifierWindow(hWnd)) {
-        // Block redraw for magnifier window
-        bRedraw = FALSE;
-        Wh_Log(L"Magnifier Headless: Modified SetWindowRgn (disabled redraw) for HWND 0x%p", hWnd);
+        bRedraw = FALSE; // Disable redraw
     }
     return SetWindowRgn_Original(hWnd, hRgn, bRedraw);
 }
@@ -331,31 +347,42 @@ int WINAPI SetWindowRgn_Hook(HWND hWnd, HRGN hRgn, BOOL bRedraw) {
 using DwmSetWindowAttribute_t = HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
 DwmSetWindowAttribute_t DwmSetWindowAttribute_Original = nullptr;
 HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute) {
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return DwmSetWindowAttribute_Original ? DwmSetWindowAttribute_Original(hWnd, dwAttribute, pvAttribute, cbAttribute) : E_FAIL;
     }
 
-    if (IsMagnifierWindow(hWnd)) {
-        // Block certain DWM attributes that could make the window visible
-        if (dwAttribute == DWMWA_CLOAK || dwAttribute == DWMWA_NCRENDERING_ENABLED) {
-            Wh_Log(L"Magnifier Headless: Blocked DwmSetWindowAttribute (attr: %lu) for HWND 0x%p", dwAttribute, hWnd);
-            return S_OK; // Pretend it succeeded
-        }
+    if (IsMagnifierWindow(hWnd) && (dwAttribute == DWMWA_CLOAK || dwAttribute == DWMWA_NCRENDERING_ENABLED)) {
+        return S_OK; // Block these attributes
     }
     return DwmSetWindowAttribute_Original(hWnd, dwAttribute, pvAttribute, cbAttribute);
 }
 
 // --- WINDOW PROCEDURE HOOK ---
 
-// Subclassed window procedure for Magnifier window
+// Subclassed window procedure for Magnifier window (optimized)
 LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Fast path: Handle high-frequency messages without logging
     switch (uMsg) {
+        case WM_PAINT:
+        case WM_ERASEBKGND:
+            // Suppress painting (no log for performance)
+            ValidateRect(hWnd, NULL);
+            return 0;
+
+        case WM_NCPAINT:
+        case WM_SYNCPAINT:
+        case WM_TIMER:
+        case WM_NCHITTEST:
+            // Silently ignore high-frequency messages
+            return 0;
+
         case WM_SHOWWINDOW:
             // Block WM_SHOWWINDOW if trying to show
             if (wParam) {
-                Wh_Log(L"Magnifier Headless: Blocked WM_SHOWWINDOW in WndProc for HWND 0x%p", hWnd);
-                return 0; // Message handled
+                if (LOG_HIGH_FREQ_MESSAGES) {
+                    Wh_Log(L"Magnifier Headless: Blocked WM_SHOWWINDOW in WndProc");
+                }
+                return 0;
             }
             break;
 
@@ -363,20 +390,12 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
             // Modify WINDOWPOS structure to prevent showing
             if (lParam) {
                 WINDOWPOS* pWp = (WINDOWPOS*)lParam;
-                BOOL modified = FALSE;
-
                 if (!(pWp->flags & SWP_NOACTIVATE)) {
-                    pWp->flags |= SWP_NOACTIVATE; // Prevent activation
-                    modified = TRUE;
+                    pWp->flags |= SWP_NOACTIVATE;
                 }
                 if (pWp->flags & SWP_SHOWWINDOW) {
-                    pWp->flags &= ~SWP_SHOWWINDOW; // Remove show flag
-                    pWp->flags |= SWP_HIDEWINDOW;  // Add hide flag
-                    modified = TRUE;
-                }
-
-                if (modified) {
-                    Wh_Log(L"Magnifier Headless: Modified WM_WINDOWPOSCHANGING in WndProc for HWND 0x%p", hWnd);
+                    pWp->flags &= ~SWP_SHOWWINDOW;
+                    pWp->flags |= SWP_HIDEWINDOW;
                 }
             }
             break;
@@ -385,7 +404,6 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
             // Ensure window remains hidden after position change
             if (IsWindowVisible(hWnd)) {
                 ShowWindow_Original(hWnd, SW_HIDE);
-                Wh_Log(L"Magnifier Headless: Re-hid window in WndProc after WM_WINDOWPOSCHANGED for HWND 0x%p", hWnd);
             }
             break;
 
@@ -393,36 +411,22 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
         case WM_NCACTIVATE:
             // Block activation
             if (wParam != WA_INACTIVE) {
-                Wh_Log(L"Magnifier Headless: Blocked activation message 0x%X in WndProc for HWND 0x%p", uMsg, hWnd);
-                return 0; // Message handled
+                return 0;
             }
             break;
 
-        case WM_PAINT:
-        case WM_ERASEBKGND:
-            // Suppress painting
-            Wh_Log(L"Magnifier Headless: Suppressed paint message 0x%X in WndProc for HWND 0x%p", uMsg, hWnd);
-            ValidateRect(hWnd, NULL); // Mark as painted
-            return 0; // Message handled
-            break;
-
         case WM_SETFOCUS:
-            // Block focus - set focus back to NULL
-            Wh_Log(L"Magnifier Headless: Blocked WM_SETFOCUS in WndProc for HWND 0x%p", hWnd);
+            // Block focus
             SetFocus(NULL);
-            return 0; // Message handled
-            break;
+            return 0;
 
         case WM_MOUSEACTIVATE:
             // Prevent mouse activation
-            Wh_Log(L"Magnifier Headless: Blocked WM_MOUSEACTIVATE in WndProc for HWND 0x%p", hWnd);
             return MA_NOACTIVATE;
-            break;
 
         case WM_SYSCOMMAND:
             // Block system commands that might show the window
             if (wParam == SC_RESTORE || wParam == SC_MAXIMIZE) {
-                Wh_Log(L"Magnifier Headless: Blocked WM_SYSCOMMAND (0x%X) in WndProc for HWND 0x%p", wParam, hWnd);
                 return 0;
             }
             break;
@@ -432,32 +436,28 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     return g_OriginalMagnifierWndProc ? CallWindowProcW(g_OriginalMagnifierWndProc, hWnd, uMsg, wParam, lParam) : DefWindowProcW(hWnd, uMsg, wParam, lParam);
 }
 
-// CallWndProc hook to detect and subclass Magnifier windows
+// CallWndProc hook to detect and subclass Magnifier windows (optimized)
 LRESULT CALLBACK CallWndProc_Hook(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && InterlockedCompareExchange(&g_lInitialized, 0, 0) != 0) {
+    if (nCode >= 0 && g_lInitialized) {
         CWPSTRUCT* pCwp = (CWPSTRUCT*)lParam;
 
         if (pCwp && IsMagnifierWindow(pCwp->hwnd)) {
-            // Thread-safe check if already subclassed
-            BOOL alreadySubclassed = FALSE;
-            {
-                AutoCriticalSection lock(&g_csGlobalState);
-                alreadySubclassed = (g_hSubclassedMagnifierWnd == pCwp->hwnd);
-            }
-
-            if (!alreadySubclassed) {
-                // Check if this window's WndProc is not already our hook
+            // Fast path: Check if already subclassed without lock
+            if (g_hSubclassedMagnifierWnd != pCwp->hwnd) {
                 WNDPROC currentProc = (WNDPROC)GetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC);
                 if (currentProc != MagnifierWndProc_Hook && currentProc != NULL) {
                     // Thread-safe subclassing
                     {
                         AutoCriticalSection lock(&g_csGlobalState);
-                        g_OriginalMagnifierWndProc = currentProc;
-                        g_hSubclassedMagnifierWnd = pCwp->hwnd;
+                        // Double-check after acquiring lock
+                        if (g_hSubclassedMagnifierWnd != pCwp->hwnd) {
+                            g_OriginalMagnifierWndProc = currentProc;
+                            g_hSubclassedMagnifierWnd = pCwp->hwnd;
+                        }
                     }
 
                     SetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC, (LONG_PTR)MagnifierWndProc_Hook);
-                    Wh_Log(L"Magnifier Headless: Subclassed Magnifier window (HWND: 0x%p, Original WndProc: 0x%p)", pCwp->hwnd, currentProc);
+                    Wh_Log(L"Magnifier Headless: Subclassed Magnifier window (HWND: 0x%p)", pCwp->hwnd);
                 }
             }
         }
@@ -466,7 +466,7 @@ LRESULT CALLBACK CallWndProc_Hook(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(g_hCallWndProcHook, nCode, wParam, lParam);
 }
 
-// CreateWindowExW hook to catch Magnifier window creation
+// CreateWindowExW hook to catch Magnifier window creation (optimized)
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original = nullptr;
 HWND WINAPI CreateWindowExW_Hook(
@@ -474,44 +474,34 @@ HWND WINAPI CreateWindowExW_Hook(
     int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu,
     HINSTANCE hInstance, LPVOID lpParam) {
 
-    // Only proceed if initialization is complete
-    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+    if (!g_lInitialized) {
         return CreateWindowExW_Original ? CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName,
                                           dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam) : NULL;
     }
 
     BOOL isMagnifierClass = FALSE;
     if (((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
-        if (wcscmp(lpClassName, L"MagUIClass") == 0 ||
-            wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) {
+        // Optimized: Check first character before full string comparison
+        if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"MagUIClass") == 0) ||
+            (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0)) {
             isMagnifierClass = TRUE;
-            // Proactively remove styles that would make the window visible or show it in the taskbar
             dwStyle &= ~WS_VISIBLE;
             dwExStyle &= ~WS_EX_APPWINDOW;
-            dwExStyle |= WS_EX_TOOLWINDOW; // Force tool window (no taskbar)
-            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation (class: %s)", lpClassName);
+            dwExStyle |= WS_EX_TOOLWINDOW;
+            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation");
         }
     }
 
     HWND hwnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y,
                                   nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 
-    // If the created window is the Magnifier UI, immediately re-parent it to our hidden host window
     if (hwnd && isMagnifierClass) {
-        Wh_Log(L"Magnifier Headless: Magnifier window created (HWND: 0x%p). Applying restrictions...", hwnd);
-
-        // Thread-safe access to g_hHostWnd
-        HWND hostWnd = NULL;
-        {
-            AutoCriticalSection lock(&g_csGlobalState);
-            hostWnd = g_hHostWnd;
-        }
-
+        // Fast path: Read g_hHostWnd without lock (it's stable after init)
+        HWND hostWnd = g_hHostWnd;
         if (hostWnd) {
             SetParent(hwnd, hostWnd);
         }
 
-        // Ensure it's explicitly hidden
         ShowWindow_Original(hwnd, SW_HIDE);
 
         // Force update styles
@@ -527,7 +517,11 @@ HWND WINAPI CreateWindowExW_Hook(
 // --- MOD INITIALIZATION ---
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Magnifier Headless: Initializing (thread-safe version)...");
+    Wh_Log(L"Magnifier Headless: Initializing (performance-optimized version)...");
+
+    // Store current process ID for fast filtering
+    g_dwMagnifyProcessId = GetCurrentProcessId();
+    Wh_Log(L"Magnifier Headless: Running in process ID: %lu", g_dwMagnifyProcessId);
 
     // Initialize critical section first (before any hook operations)
     if (!InitializeCriticalSectionAndSpinCount(&g_csGlobalState, 0x400)) {
