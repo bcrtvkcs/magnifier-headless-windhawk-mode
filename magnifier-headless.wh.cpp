@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.8.0
+// @version         0.9.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -15,12 +15,48 @@
 # Magnifier Headless Mode
 This mod blocks the Magnifier window from ever appearing, while keeping the zoom functionality (Win + `-` and Win + `+`) available. It also prevents the Magnifier from showing up in the taskbar.
 
-This is achieved by hooking several Windows API functions (`CreateWindowExW`, `ShowWindow`, `SetWindowPos`, and `SetWindowLongPtrW`) to intercept any attempts to create, show, or change the style of the Magnifier window.
+## Features
+- Completely hides the Magnifier UI while preserving zoom functionality
+- Thread-safe implementation with race condition protection
+- Performance optimized with HWND caching
+- Comprehensive API coverage for all window visibility methods
+
+## Hooked APIs
+The mod hooks multiple Windows API functions to ensure complete coverage:
+
+**Core Window APIs:**
+- `CreateWindowExW` - Intercepts window creation
+- `ShowWindow` - Blocks window showing
+- `SetWindowPos` - Prevents position-based showing
+- `SetWindowLongPtrW` - Blocks style changes
+
+**Layered Window APIs:**
+- `UpdateLayeredWindow` - Blocks layered window updates
+- `SetLayeredWindowAttributes` - Blocks transparency changes
+
+**Animation & Foreground APIs:**
+- `AnimateWindow` - Blocks animated showing
+- `BringWindowToTop` - Prevents bringing to front
+- `SetForegroundWindow` - Blocks foreground activation
+
+**Advanced APIs:**
+- `SetWindowRgn` - Blocks region-based visibility
+- `DwmSetWindowAttribute` - Blocks DWM attribute changes (Windows 11+)
+
+## Technical Implementation
+- Uses CRITICAL_SECTION for thread-safe global state management
+- Atomic operations (InterlockedExchange) for initialization flags
+- Circular buffer cache for fast window detection
+- RAII pattern (AutoCriticalSection) for safe lock management
+- Proper hook ordering to prevent race conditions
 */
 // ==/WindhawkModReadme==
 
 #include <windows.h>
 #include <windhawk_api.h>
+#include <dwmapi.h>
+
+#pragma comment(lib, "dwmapi.lib")
 
 // ===========================
 // THREAD-SAFE GLOBAL STATE
@@ -167,6 +203,130 @@ LONG_PTR WINAPI SetWindowLongPtrW_Hook(HWND hWnd, int nIndex, LONG_PTR dwNewLong
     return SetWindowLongPtrW_Original(hWnd, nIndex, dwNewLong);
 }
 
+// UpdateLayeredWindow hook to prevent layered window updates from showing the window
+using UpdateLayeredWindow_t = decltype(&UpdateLayeredWindow);
+UpdateLayeredWindow_t UpdateLayeredWindow_Original = nullptr;
+BOOL WINAPI UpdateLayeredWindow_Hook(
+    HWND hWnd, HDC hdcDst, POINT* pptDst, SIZE* psize,
+    HDC hdcSrc, POINT* pptSrc, COLORREF crKey,
+    BLENDFUNCTION* pblend, DWORD dwFlags) {
+
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return UpdateLayeredWindow_Original ? UpdateLayeredWindow_Original(hWnd, hdcDst, pptDst, psize,
+                                              hdcSrc, pptSrc, crKey, pblend, dwFlags) : FALSE;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        Wh_Log(L"Magnifier Headless: Blocked UpdateLayeredWindow for HWND 0x%p", hWnd);
+        return TRUE; // Pretend it succeeded
+    }
+    return UpdateLayeredWindow_Original(hWnd, hdcDst, pptDst, psize, hdcSrc, pptSrc, crKey, pblend, dwFlags);
+}
+
+// SetLayeredWindowAttributes hook to prevent layered window attribute changes
+using SetLayeredWindowAttributes_t = decltype(&SetLayeredWindowAttributes);
+SetLayeredWindowAttributes_t SetLayeredWindowAttributes_Original = nullptr;
+BOOL WINAPI SetLayeredWindowAttributes_Hook(HWND hWnd, COLORREF crKey, BYTE bAlpha, DWORD dwFlags) {
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return SetLayeredWindowAttributes_Original ? SetLayeredWindowAttributes_Original(hWnd, crKey, bAlpha, dwFlags) : FALSE;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        Wh_Log(L"Magnifier Headless: Blocked SetLayeredWindowAttributes for HWND 0x%p", hWnd);
+        return TRUE; // Pretend it succeeded
+    }
+    return SetLayeredWindowAttributes_Original(hWnd, crKey, bAlpha, dwFlags);
+}
+
+// AnimateWindow hook to prevent animated window showing
+using AnimateWindow_t = decltype(&AnimateWindow);
+AnimateWindow_t AnimateWindow_Original = nullptr;
+BOOL WINAPI AnimateWindow_Hook(HWND hWnd, DWORD dwTime, DWORD dwFlags) {
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return AnimateWindow_Original ? AnimateWindow_Original(hWnd, dwTime, dwFlags) : FALSE;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        // Only block if it's trying to show the window
+        if (!(dwFlags & AW_HIDE)) {
+            Wh_Log(L"Magnifier Headless: Blocked AnimateWindow (show) for HWND 0x%p", hWnd);
+            return TRUE; // Pretend it succeeded
+        }
+    }
+    return AnimateWindow_Original(hWnd, dwTime, dwFlags);
+}
+
+// BringWindowToTop hook to prevent bringing window to foreground
+using BringWindowToTop_t = decltype(&BringWindowToTop);
+BringWindowToTop_t BringWindowToTop_Original = nullptr;
+BOOL WINAPI BringWindowToTop_Hook(HWND hWnd) {
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return BringWindowToTop_Original ? BringWindowToTop_Original(hWnd) : FALSE;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        Wh_Log(L"Magnifier Headless: Blocked BringWindowToTop for HWND 0x%p", hWnd);
+        return TRUE; // Pretend it succeeded
+    }
+    return BringWindowToTop_Original(hWnd);
+}
+
+// SetForegroundWindow hook to prevent setting as foreground window
+using SetForegroundWindow_t = decltype(&SetForegroundWindow);
+SetForegroundWindow_t SetForegroundWindow_Original = nullptr;
+BOOL WINAPI SetForegroundWindow_Hook(HWND hWnd) {
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return SetForegroundWindow_Original ? SetForegroundWindow_Original(hWnd) : FALSE;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        Wh_Log(L"Magnifier Headless: Blocked SetForegroundWindow for HWND 0x%p", hWnd);
+        return TRUE; // Pretend it succeeded
+    }
+    return SetForegroundWindow_Original(hWnd);
+}
+
+// SetWindowRgn hook to prevent region changes that might make window visible
+using SetWindowRgn_t = decltype(&SetWindowRgn);
+SetWindowRgn_t SetWindowRgn_Original = nullptr;
+int WINAPI SetWindowRgn_Hook(HWND hWnd, HRGN hRgn, BOOL bRedraw) {
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return SetWindowRgn_Original ? SetWindowRgn_Original(hWnd, hRgn, bRedraw) : 0;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        // Block redraw for magnifier window
+        bRedraw = FALSE;
+        Wh_Log(L"Magnifier Headless: Modified SetWindowRgn (disabled redraw) for HWND 0x%p", hWnd);
+    }
+    return SetWindowRgn_Original(hWnd, hRgn, bRedraw);
+}
+
+// DwmSetWindowAttribute hook for Windows 11+ DWM features
+using DwmSetWindowAttribute_t = HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+DwmSetWindowAttribute_t DwmSetWindowAttribute_Original = nullptr;
+HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute) {
+    // Only proceed if initialization is complete
+    if (InterlockedCompareExchange(&g_lInitialized, 0, 0) == 0) {
+        return DwmSetWindowAttribute_Original ? DwmSetWindowAttribute_Original(hWnd, dwAttribute, pvAttribute, cbAttribute) : E_FAIL;
+    }
+
+    if (IsMagnifierWindow(hWnd)) {
+        // Block certain DWM attributes that could make the window visible
+        if (dwAttribute == DWMWA_CLOAK || dwAttribute == DWMWA_NCRENDERING_ENABLED) {
+            Wh_Log(L"Magnifier Headless: Blocked DwmSetWindowAttribute (attr: %lu) for HWND 0x%p", dwAttribute, hWnd);
+            return S_OK; // Pretend it succeeded
+        }
+    }
+    return DwmSetWindowAttribute_Original(hWnd, dwAttribute, pvAttribute, cbAttribute);
+}
+
 // CreateWindowExW hook to catch Magnifier window creation
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original = nullptr;
@@ -239,15 +399,59 @@ BOOL Wh_ModInit() {
 
     // Set up all hooks BEFORE creating windows to prevent race conditions
     Wh_Log(L"Magnifier Headless: Setting up function hooks...");
+
+    // Core window hooks
     if (!Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original) ||
         !Wh_SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original) ||
         !Wh_SetFunctionHook((void*)SetWindowPos, (void*)SetWindowPos_Hook, (void**)&SetWindowPos_Original) ||
         !Wh_SetFunctionHook((void*)SetWindowLongPtrW, (void*)SetWindowLongPtrW_Hook, (void**)&SetWindowLongPtrW_Original)) {
-        Wh_Log(L"Magnifier Headless: Failed to set up one or more hooks.");
+        Wh_Log(L"Magnifier Headless: Failed to set up core window hooks.");
         DeleteCriticalSection(&g_csGlobalState);
         g_bCriticalSectionInitialized = FALSE;
         return FALSE;
     }
+
+    // Layered window hooks
+    if (!Wh_SetFunctionHook((void*)UpdateLayeredWindow, (void*)UpdateLayeredWindow_Hook, (void**)&UpdateLayeredWindow_Original) ||
+        !Wh_SetFunctionHook((void*)SetLayeredWindowAttributes, (void*)SetLayeredWindowAttributes_Hook, (void**)&SetLayeredWindowAttributes_Original)) {
+        Wh_Log(L"Magnifier Headless: Failed to set up layered window hooks.");
+        DeleteCriticalSection(&g_csGlobalState);
+        g_bCriticalSectionInitialized = FALSE;
+        return FALSE;
+    }
+
+    // Animation and foreground hooks
+    if (!Wh_SetFunctionHook((void*)AnimateWindow, (void*)AnimateWindow_Hook, (void**)&AnimateWindow_Original) ||
+        !Wh_SetFunctionHook((void*)BringWindowToTop, (void*)BringWindowToTop_Hook, (void**)&BringWindowToTop_Original) ||
+        !Wh_SetFunctionHook((void*)SetForegroundWindow, (void*)SetForegroundWindow_Hook, (void**)&SetForegroundWindow_Original)) {
+        Wh_Log(L"Magnifier Headless: Failed to set up animation/foreground hooks.");
+        DeleteCriticalSection(&g_csGlobalState);
+        g_bCriticalSectionInitialized = FALSE;
+        return FALSE;
+    }
+
+    // Region hook
+    if (!Wh_SetFunctionHook((void*)SetWindowRgn, (void*)SetWindowRgn_Hook, (void**)&SetWindowRgn_Original)) {
+        Wh_Log(L"Magnifier Headless: Failed to set up region hook.");
+        DeleteCriticalSection(&g_csGlobalState);
+        g_bCriticalSectionInitialized = FALSE;
+        return FALSE;
+    }
+
+    // DWM hook (optional - may not exist on older Windows versions)
+    HMODULE hDwmapi = LoadLibraryW(L"dwmapi.dll");
+    if (hDwmapi) {
+        DwmSetWindowAttribute_Original = (DwmSetWindowAttribute_t)GetProcAddress(hDwmapi, "DwmSetWindowAttribute");
+        if (DwmSetWindowAttribute_Original) {
+            if (!Wh_SetFunctionHook((void*)DwmSetWindowAttribute_Original, (void*)DwmSetWindowAttribute_Hook, (void**)&DwmSetWindowAttribute_Original)) {
+                Wh_Log(L"Magnifier Headless: Warning - Failed to set up DWM hook (non-critical).");
+            } else {
+                Wh_Log(L"Magnifier Headless: DWM hook set up successfully.");
+            }
+        }
+    }
+
+    Wh_Log(L"Magnifier Headless: All hooks set up successfully.");
 
     // Now create the hidden window (after hooks are in place)
     Wh_Log(L"Magnifier Headless: Creating hidden host window...");
