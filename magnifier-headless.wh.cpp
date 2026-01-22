@@ -639,6 +639,27 @@ HWND WINAPI CreateWindowExW_Hook(
 
 // --- MOD INITIALIZATION ---
 
+// Callback for EnumThreadWindows to hide existing Magnifier windows
+static BOOL CALLBACK HideExistingMagnifierWindowsCallback(HWND hwnd, LPARAM lParam) {
+    int* pCount = (int*)lParam;
+    if (IsMagnifierWindow(hwnd)) {
+        Wh_Log(L"Magnifier Headless: Found existing Magnifier window (HWND: 0x%p)", hwnd);
+
+        // Hide it immediately
+        ShowWindow(hwnd, SW_HIDE);
+
+        // Update styles
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_VISIBLE);
+
+        LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+
+        (*pCount)++;
+    }
+    return TRUE; // Continue enumeration
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L"Magnifier Headless: Initializing (performance-optimized version)...");
 
@@ -761,29 +782,10 @@ BOOL Wh_ModInit() {
 
     // Hide any existing Magnifier windows that were created before hooks
     Wh_Log(L"Magnifier Headless: Scanning for existing Magnifier windows...");
-    DWORD currentProcessId = GetCurrentProcessId();
     int hiddenCount = 0;
 
-    // Enumerate all windows in current process
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM lParam) -> BOOL {
-        int* pCount = (int*)lParam;
-        if (IsMagnifierWindow(hwnd)) {
-            Wh_Log(L"Magnifier Headless: Found existing Magnifier window (HWND: 0x%p)", hwnd);
-
-            // Hide it immediately
-            ShowWindow(hwnd, SW_HIDE);
-
-            // Update styles
-            LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_VISIBLE);
-
-            LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
-
-            (*pCount)++;
-        }
-        return TRUE; // Continue enumeration
-    }, (LPARAM)&hiddenCount);
+    // Enumerate all windows in current thread
+    EnumThreadWindows(GetCurrentThreadId(), HideExistingMagnifierWindowsCallback, (LPARAM)&hiddenCount);
 
     Wh_Log(L"Magnifier Headless: Hidden %d existing window(s).", hiddenCount);
     Wh_Log(L"Magnifier Headless: Initialization complete. All systems ready.");
