@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.2.2
+// @version         1.2.1
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -232,6 +232,15 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
         return FALSE;
     }
 
+    // Fast path: Process ID check (if available)
+    if (g_dwMagnifyProcessId != 0) {
+        DWORD dwProcessId = 0;
+        GetWindowThreadProcessId(hwnd, &dwProcessId);
+        if (dwProcessId != g_dwMagnifyProcessId) {
+            return FALSE; // Different process, definitely not Magnifier
+        }
+    }
+
     // Fast path: Check cache first (thread-safe with minimal locking)
     DWORD currentTick = GetTickCount();
     {
@@ -245,8 +254,8 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     }
 
     // Slow path: Not in cache, check class name
-    wchar_t className[64] = {0}; // Increased size for longer class names
-    if (!SafeGetClassName(hwnd, className, 64)) {
+    wchar_t className[32] = {0}; // Reduced size for performance
+    if (!SafeGetClassName(hwnd, className, 32)) {
         return FALSE;
     }
 
@@ -612,24 +621,24 @@ HWND WINAPI CreateWindowExW_Hook(
                                   nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 
     if (hwnd && isMagnifierClass) {
-        // Immediately hide the window - no blocking operations
+        // Fast path: Read g_hHostWnd without lock (it's stable after init)
+        HWND hostWnd = g_hHostWnd;
+        if (hostWnd && SafeIsWindow(hostWnd)) {
+            SafeSetParent(hwnd, hostWnd);
+        }
+
+        // Hide window with safety check
         if (ShowWindow_Original && SafeIsWindow(hwnd)) {
             ShowWindow_Original(hwnd, SW_HIDE);
         }
 
-        // Force update styles with safe API (non-blocking)
+        // Force update styles with safe API
         if (SetWindowLongPtrW_Original && SafeIsWindow(hwnd)) {
             LONG_PTR currentStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
             SafeSetWindowLongPtrW(hwnd, GWL_STYLE, currentStyle & ~WS_VISIBLE);
 
             LONG_PTR currentExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             SafeSetWindowLongPtrW(hwnd, GWL_EXSTYLE, (currentExStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
-        }
-
-        // Try to set parent to hidden window (non-blocking, single attempt)
-        HWND hostWnd = g_hHostWnd;
-        if (hostWnd && SafeIsWindow(hostWnd) && SafeIsWindow(hwnd)) {
-            SetParent(hwnd, hostWnd);
         }
     }
 
@@ -759,33 +768,6 @@ BOOL Wh_ModInit() {
     // Mark initialization as complete (atomic operation)
     InterlockedExchange(&g_lInitialized, 1);
 
-    // Hide any existing Magnifier windows that were created before hooks
-    Wh_Log(L"Magnifier Headless: Scanning for existing Magnifier windows...");
-    DWORD currentProcessId = GetCurrentProcessId();
-    int hiddenCount = 0;
-
-    // Enumerate all windows in current process
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM lParam) -> BOOL {
-        int* pCount = (int*)lParam;
-        if (IsMagnifierWindow(hwnd)) {
-            Wh_Log(L"Magnifier Headless: Found existing Magnifier window (HWND: 0x%p)", hwnd);
-
-            // Hide it immediately
-            ShowWindow(hwnd, SW_HIDE);
-
-            // Update styles
-            LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_VISIBLE);
-
-            LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
-
-            (*pCount)++;
-        }
-        return TRUE; // Continue enumeration
-    }, (LPARAM)&hiddenCount);
-
-    Wh_Log(L"Magnifier Headless: Hidden %d existing window(s).", hiddenCount);
     Wh_Log(L"Magnifier Headless: Initialization complete. All systems ready.");
     return TRUE;
 }
