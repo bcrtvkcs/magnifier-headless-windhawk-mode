@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.9.0
+// @version         1.0.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -43,6 +43,18 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
 - `SetWindowRgn` - Blocks region-based visibility
 - `DwmSetWindowAttribute` - Blocks DWM attribute changes (Windows 11+)
 
+**Window Message Interception:**
+- Window Procedure Subclassing - Direct interception of window messages
+  * Blocks `WM_SHOWWINDOW` (show requests)
+  * Modifies `WM_WINDOWPOSCHANGING` (prevents showing via position changes)
+  * Enforces hiding on `WM_WINDOWPOSCHANGED`
+  * Blocks `WM_ACTIVATE` and `WM_NCACTIVATE` (activation prevention)
+  * Suppresses `WM_PAINT` and `WM_ERASEBKGND` (no visual artifacts)
+  * Blocks `WM_SETFOCUS` (focus prevention)
+  * Blocks `WM_MOUSEACTIVATE` (mouse activation prevention)
+  * Blocks `WM_SYSCOMMAND` (SC_RESTORE, SC_MAXIMIZE prevention)
+- `WH_CALLWNDPROC` hook - Detects Magnifier windows and applies subclassing automatically
+
 ## Technical Implementation
 - Uses CRITICAL_SECTION for thread-safe global state management
 - Atomic operations (InterlockedExchange) for initialization flags
@@ -79,6 +91,13 @@ struct {
     BOOL isMagnifier;
 } g_windowCache[MAX_CACHED_MAGNIFIER_WINDOWS] = {0};
 int g_cacheIndex = 0;
+
+// Window procedure hook handle
+HHOOK g_hCallWndProcHook = NULL;
+
+// Original window procedure and HWND for subclassed Magnifier window (protected by g_csGlobalState)
+WNDPROC g_OriginalMagnifierWndProc = NULL;
+HWND g_hSubclassedMagnifierWnd = NULL;
 
 // Helper: Safe enter/leave critical section
 class AutoCriticalSection {
@@ -327,6 +346,126 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd, DWORD dwAttribute, LPCVOID 
     return DwmSetWindowAttribute_Original(hWnd, dwAttribute, pvAttribute, cbAttribute);
 }
 
+// --- WINDOW PROCEDURE HOOK ---
+
+// Subclassed window procedure for Magnifier window
+LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+        case WM_SHOWWINDOW:
+            // Block WM_SHOWWINDOW if trying to show
+            if (wParam) {
+                Wh_Log(L"Magnifier Headless: Blocked WM_SHOWWINDOW in WndProc for HWND 0x%p", hWnd);
+                return 0; // Message handled
+            }
+            break;
+
+        case WM_WINDOWPOSCHANGING:
+            // Modify WINDOWPOS structure to prevent showing
+            if (lParam) {
+                WINDOWPOS* pWp = (WINDOWPOS*)lParam;
+                BOOL modified = FALSE;
+
+                if (!(pWp->flags & SWP_NOACTIVATE)) {
+                    pWp->flags |= SWP_NOACTIVATE; // Prevent activation
+                    modified = TRUE;
+                }
+                if (pWp->flags & SWP_SHOWWINDOW) {
+                    pWp->flags &= ~SWP_SHOWWINDOW; // Remove show flag
+                    pWp->flags |= SWP_HIDEWINDOW;  // Add hide flag
+                    modified = TRUE;
+                }
+
+                if (modified) {
+                    Wh_Log(L"Magnifier Headless: Modified WM_WINDOWPOSCHANGING in WndProc for HWND 0x%p", hWnd);
+                }
+            }
+            break;
+
+        case WM_WINDOWPOSCHANGED:
+            // Ensure window remains hidden after position change
+            if (IsWindowVisible(hWnd)) {
+                ShowWindow_Original(hWnd, SW_HIDE);
+                Wh_Log(L"Magnifier Headless: Re-hid window in WndProc after WM_WINDOWPOSCHANGED for HWND 0x%p", hWnd);
+            }
+            break;
+
+        case WM_ACTIVATE:
+        case WM_NCACTIVATE:
+            // Block activation
+            if (wParam != WA_INACTIVE) {
+                Wh_Log(L"Magnifier Headless: Blocked activation message 0x%X in WndProc for HWND 0x%p", uMsg, hWnd);
+                return 0; // Message handled
+            }
+            break;
+
+        case WM_PAINT:
+        case WM_ERASEBKGND:
+            // Suppress painting
+            Wh_Log(L"Magnifier Headless: Suppressed paint message 0x%X in WndProc for HWND 0x%p", uMsg, hWnd);
+            ValidateRect(hWnd, NULL); // Mark as painted
+            return 0; // Message handled
+            break;
+
+        case WM_SETFOCUS:
+            // Block focus - set focus back to NULL
+            Wh_Log(L"Magnifier Headless: Blocked WM_SETFOCUS in WndProc for HWND 0x%p", hWnd);
+            SetFocus(NULL);
+            return 0; // Message handled
+            break;
+
+        case WM_MOUSEACTIVATE:
+            // Prevent mouse activation
+            Wh_Log(L"Magnifier Headless: Blocked WM_MOUSEACTIVATE in WndProc for HWND 0x%p", hWnd);
+            return MA_NOACTIVATE;
+            break;
+
+        case WM_SYSCOMMAND:
+            // Block system commands that might show the window
+            if (wParam == SC_RESTORE || wParam == SC_MAXIMIZE) {
+                Wh_Log(L"Magnifier Headless: Blocked WM_SYSCOMMAND (0x%X) in WndProc for HWND 0x%p", wParam, hWnd);
+                return 0;
+            }
+            break;
+    }
+
+    // Call original window procedure for unhandled messages
+    return g_OriginalMagnifierWndProc ? CallWindowProcW(g_OriginalMagnifierWndProc, hWnd, uMsg, wParam, lParam) : DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+// CallWndProc hook to detect and subclass Magnifier windows
+LRESULT CALLBACK CallWndProc_Hook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && InterlockedCompareExchange(&g_lInitialized, 0, 0) != 0) {
+        CWPSTRUCT* pCwp = (CWPSTRUCT*)lParam;
+
+        if (pCwp && IsMagnifierWindow(pCwp->hwnd)) {
+            // Thread-safe check if already subclassed
+            BOOL alreadySubclassed = FALSE;
+            {
+                AutoCriticalSection lock(&g_csGlobalState);
+                alreadySubclassed = (g_hSubclassedMagnifierWnd == pCwp->hwnd);
+            }
+
+            if (!alreadySubclassed) {
+                // Check if this window's WndProc is not already our hook
+                WNDPROC currentProc = (WNDPROC)GetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC);
+                if (currentProc != MagnifierWndProc_Hook && currentProc != NULL) {
+                    // Thread-safe subclassing
+                    {
+                        AutoCriticalSection lock(&g_csGlobalState);
+                        g_OriginalMagnifierWndProc = currentProc;
+                        g_hSubclassedMagnifierWnd = pCwp->hwnd;
+                    }
+
+                    SetWindowLongPtrW(pCwp->hwnd, GWLP_WNDPROC, (LONG_PTR)MagnifierWndProc_Hook);
+                    Wh_Log(L"Magnifier Headless: Subclassed Magnifier window (HWND: 0x%p, Original WndProc: 0x%p)", pCwp->hwnd, currentProc);
+                }
+            }
+        }
+    }
+
+    return CallNextHookEx(g_hCallWndProcHook, nCode, wParam, lParam);
+}
+
 // CreateWindowExW hook to catch Magnifier window creation
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original = nullptr;
@@ -453,6 +592,16 @@ BOOL Wh_ModInit() {
 
     Wh_Log(L"Magnifier Headless: All hooks set up successfully.");
 
+    // Install window procedure hook to intercept messages
+    Wh_Log(L"Magnifier Headless: Installing window procedure hook...");
+    g_hCallWndProcHook = SetWindowsHookExW(WH_CALLWNDPROC, CallWndProc_Hook, NULL, GetCurrentThreadId());
+    if (!g_hCallWndProcHook) {
+        Wh_Log(L"Magnifier Headless: Warning - Failed to install window procedure hook (error: %lu).", GetLastError());
+        // Non-critical, continue anyway
+    } else {
+        Wh_Log(L"Magnifier Headless: Window procedure hook installed successfully.");
+    }
+
     // Now create the hidden window (after hooks are in place)
     Wh_Log(L"Magnifier Headless: Creating hidden host window...");
     WNDCLASSW wc = {};
@@ -502,6 +651,29 @@ void Wh_ModUninit() {
 
     // Mark as uninitialized (atomic operation)
     InterlockedExchange(&g_lInitialized, 0);
+
+    // Unhook window procedure hook
+    if (g_hCallWndProcHook) {
+        UnhookWindowsHookEx(g_hCallWndProcHook);
+        g_hCallWndProcHook = NULL;
+        Wh_Log(L"Magnifier Headless: Window procedure hook removed.");
+    }
+
+    // Restore original window procedure if subclassed
+    HWND hSubclassedWnd = NULL;
+    WNDPROC originalProc = NULL;
+    {
+        AutoCriticalSection lock(&g_csGlobalState);
+        hSubclassedWnd = g_hSubclassedMagnifierWnd;
+        originalProc = g_OriginalMagnifierWndProc;
+        g_hSubclassedMagnifierWnd = NULL;
+        g_OriginalMagnifierWndProc = NULL;
+    }
+
+    if (hSubclassedWnd && IsWindow(hSubclassedWnd) && originalProc) {
+        SetWindowLongPtrW(hSubclassedWnd, GWLP_WNDPROC, (LONG_PTR)originalProc);
+        Wh_Log(L"Magnifier Headless: Restored original WndProc for HWND 0x%p", hSubclassedWnd);
+    }
 
     // Thread-safe cleanup
     HWND hHostWnd = NULL;
