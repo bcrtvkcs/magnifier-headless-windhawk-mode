@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.2.0
+// @version         1.2.1
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -264,6 +264,12 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     if (className[0] == L'M' && wcscmp(className, L"MagUIClass") == 0) {
         isMagnifier = TRUE;
     } else if (className[0] == L'S' && wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
+        isMagnifier = TRUE;
+    } else if (wcsncmp(className, L"GDI+", 4) == 0) {
+        // GDI+ helper windows (e.g., "GDI+ Hook Window Class")
+        isMagnifier = TRUE;
+    } else if (wcsstr(className, L"CSPNotify") != NULL) {
+        // CSPNotify windows
         isMagnifier = TRUE;
     }
 
@@ -602,12 +608,14 @@ HWND WINAPI CreateWindowExW_Hook(
     if (((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
         // Optimized: Check first character before full string comparison
         if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"MagUIClass") == 0) ||
-            (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0)) {
+            (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
+            wcsncmp(lpClassName, L"GDI+", 4) == 0 ||
+            wcsstr(lpClassName, L"CSPNotify") != NULL) {
             isMagnifierClass = TRUE;
             dwStyle &= ~WS_VISIBLE;
             dwExStyle &= ~WS_EX_APPWINDOW;
             dwExStyle |= WS_EX_TOOLWINDOW;
-            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation");
+            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation (class: %ls)", lpClassName);
         }
     }
 
