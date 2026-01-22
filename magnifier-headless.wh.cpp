@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.3.2
+// @version         1.4.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -256,10 +256,9 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
         return FALSE;
     }
 
-    // Optimized string comparison (check first character first)
+    // Check for UI windows only (NOT MagUIClass - that's functional!)
     BOOL isMagnifier = FALSE;
-    if (className[0] == L'M' && (wcscmp(className, L"MagUIClass") == 0 ||
-                                  wcscmp(className, L"Magnifier Touch") == 0)) {
+    if (className[0] == L'M' && wcscmp(className, L"Magnifier Touch") == 0) {
         isMagnifier = TRUE;
     } else if (className[0] == L'S' && wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
         isMagnifier = TRUE;
@@ -268,6 +267,7 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     } else if (className[0] == L'C' && wcscmp(className, L"CspNotify Notify Window") == 0) {
         isMagnifier = TRUE;
     }
+    // DO NOT HIDE MagUIClass - zoom functionality needs it!
 
     // Add to cache with LRU eviction (thread-safe)
     {
@@ -602,9 +602,8 @@ HWND WINAPI CreateWindowExW_Hook(
 
     BOOL isMagnifierClass = FALSE;
     if (((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
-        // Optimized: Check first character before full string comparison
-        if ((lpClassName[0] == L'M' && (wcscmp(lpClassName, L"MagUIClass") == 0 ||
-                                         wcscmp(lpClassName, L"Magnifier Touch") == 0)) ||
+        // ONLY intercept UI windows, NOT functional windows (MagUIClass needed for zoom!)
+        if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"Magnifier Touch") == 0) ||
             (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
             (lpClassName[0] == L'G' && wcscmp(lpClassName, L"GDI+ Window") == 0) ||
             (lpClassName[0] == L'C' && wcscmp(lpClassName, L"CspNotify Notify Window") == 0)) {
@@ -612,7 +611,7 @@ HWND WINAPI CreateWindowExW_Hook(
             dwStyle &= ~WS_VISIBLE;
             dwExStyle &= ~WS_EX_APPWINDOW;
             dwExStyle |= WS_EX_TOOLWINDOW;
-            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation (%ls)", lpClassName);
+            Wh_Log(L"Magnifier Headless: Intercepting UI window creation (%ls)", lpClassName);
         }
     }
 
@@ -647,7 +646,7 @@ HWND WINAPI CreateWindowExW_Hook(
 
 // --- MOD INITIALIZATION ---
 
-// EnumWindows callback to find and hide Magnifier windows
+// EnumWindows callback to find and hide Magnifier UI windows (NOT functional windows)
 static BOOL CALLBACK EnumWindowsHideCallback(HWND hwnd, LPARAM lParam) {
     int* pHiddenCount = (int*)lParam;
 
@@ -657,16 +656,19 @@ static BOOL CALLBACK EnumWindowsHideCallback(HWND hwnd, LPARAM lParam) {
         return TRUE; // Continue enumeration
     }
 
-    // Check if it's a Magnifier window
-    BOOL isMagnifierWindow = FALSE;
-    if (wcsstr(className, L"Mag") != NULL ||
+    // ONLY hide UI windows, NOT functional windows
+    // Be very specific to avoid breaking zoom functionality
+    BOOL shouldHide = FALSE;
+    if (wcscmp(className, L"ScreenMagnifierUIWnd") == 0 ||
         wcsstr(className, L"GDI+") != NULL ||
         wcsstr(className, L"CspNotify") != NULL ||
-        wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
-        isMagnifierWindow = TRUE;
+        wcscmp(className, L"Magnifier Touch") == 0) {
+        shouldHide = TRUE;
     }
 
-    if (isMagnifierWindow) {
+    // DO NOT HIDE: MagUIClass - this is needed for zoom to work!
+
+    if (shouldHide) {
         DWORD windowProcessId = 0;
         GetWindowThreadProcessId(hwnd, &windowProcessId);
         DWORD currentProcessId = GetCurrentProcessId();
@@ -674,11 +676,11 @@ static BOOL CALLBACK EnumWindowsHideCallback(HWND hwnd, LPARAM lParam) {
         if (windowProcessId == currentProcessId) {
             // Log first 20 finds for debugging
             if (g_cleanupCallCount < 20) {
-                Wh_Log(L"Magnifier Headless: [%d] Found and hiding '%ls' (HWND: 0x%p)",
+                Wh_Log(L"Magnifier Headless: [%d] Hiding UI window '%ls' (HWND: 0x%p)",
                        g_cleanupCallCount, className, hwnd);
             }
 
-            // Aggressive hiding
+            // Hide window (NOT destroy - that breaks functionality!)
             ShowWindow(hwnd, SW_HIDE);
 
             // Force invisible styles
@@ -688,8 +690,7 @@ static BOOL CALLBACK EnumWindowsHideCallback(HWND hwnd, LPARAM lParam) {
             LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
 
-            // NUCLEAR OPTION: Try to destroy it
-            DestroyWindow(hwnd);
+            // NO DestroyWindow - that kills zoom functionality!
 
             (*pHiddenCount)++;
         }
