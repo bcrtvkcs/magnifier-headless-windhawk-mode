@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.2.0
+// @version         1.2.1
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -216,9 +216,9 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
                    MAX_RETRY_ATTEMPTS, hWndChild, dwError);
         }
 
-        // Brief sleep before retry
+        // Brief sleep before retry (minimal delay to avoid mouse freeze)
         if (attempt < MAX_RETRY_ATTEMPTS - 1) {
-            Sleep(10);
+            Sleep(1);
         }
     }
 
@@ -264,6 +264,10 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     if (className[0] == L'M' && wcscmp(className, L"MagUIClass") == 0) {
         isMagnifier = TRUE;
     } else if (className[0] == L'S' && wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
+        isMagnifier = TRUE;
+    } else if (className[0] == L'G' && wcscmp(className, L"GDI+ Window") == 0) {
+        isMagnifier = TRUE;
+    } else if (className[0] == L'C' && wcscmp(className, L"CspNotify Notify Window") == 0) {
         isMagnifier = TRUE;
     }
 
@@ -602,12 +606,14 @@ HWND WINAPI CreateWindowExW_Hook(
     if (((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
         // Optimized: Check first character before full string comparison
         if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"MagUIClass") == 0) ||
-            (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0)) {
+            (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
+            (lpClassName[0] == L'G' && wcscmp(lpClassName, L"GDI+ Window") == 0) ||
+            (lpClassName[0] == L'C' && wcscmp(lpClassName, L"CspNotify Notify Window") == 0)) {
             isMagnifierClass = TRUE;
             dwStyle &= ~WS_VISIBLE;
             dwExStyle &= ~WS_EX_APPWINDOW;
             dwExStyle |= WS_EX_TOOLWINDOW;
-            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation");
+            Wh_Log(L"Magnifier Headless: Intercepting Magnifier window creation (%ls)", lpClassName);
         }
     }
 
