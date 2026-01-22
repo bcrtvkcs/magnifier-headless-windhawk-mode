@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.4.0
+// @version         1.5.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -109,7 +109,7 @@ DWORD g_dwMagnifyProcessId = 0;
 // Timer for periodic window cleanup
 UINT_PTR g_hCleanupTimer = 0;
 #define CLEANUP_TIMER_ID 1
-#define CLEANUP_INTERVAL_MS 1  // Check every 1ms (ultra aggressive)
+#define CLEANUP_INTERVAL_MS 50  // Check every 50ms (reasonable for single UI window)
 volatile LONG g_cleanupCallCount = 0;  // Debug: count cleanup calls
 
 // HWND cache for fast magnifier window detection (protected by g_csGlobalState)
@@ -256,18 +256,14 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
         return FALSE;
     }
 
-    // Check for UI windows only (NOT MagUIClass - that's functional!)
+    // ONLY hide ScreenMagnifierUIWnd - this is the main UI window
+    // Everything else (MagUIClass, GDI+, etc.) should remain untouched!
     BOOL isMagnifier = FALSE;
-    if (className[0] == L'M' && wcscmp(className, L"Magnifier Touch") == 0) {
-        isMagnifier = TRUE;
-    } else if (className[0] == L'S' && wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
-        isMagnifier = TRUE;
-    } else if (className[0] == L'G' && wcscmp(className, L"GDI+ Window") == 0) {
-        isMagnifier = TRUE;
-    } else if (className[0] == L'C' && wcscmp(className, L"CspNotify Notify Window") == 0) {
+    if (className[0] == L'S' && wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
         isMagnifier = TRUE;
     }
-    // DO NOT HIDE MagUIClass - zoom functionality needs it!
+    // DO NOT TOUCH: MagUIClass, GDI+, CspNotify, Magnifier Touch
+    // These may be needed for functionality
 
     // Add to cache with LRU eviction (thread-safe)
     {
@@ -602,16 +598,14 @@ HWND WINAPI CreateWindowExW_Hook(
 
     BOOL isMagnifierClass = FALSE;
     if (((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
-        // ONLY intercept UI windows, NOT functional windows (MagUIClass needed for zoom!)
-        if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"Magnifier Touch") == 0) ||
-            (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
-            (lpClassName[0] == L'G' && wcscmp(lpClassName, L"GDI+ Window") == 0) ||
-            (lpClassName[0] == L'C' && wcscmp(lpClassName, L"CspNotify Notify Window") == 0)) {
+        // ONLY intercept ScreenMagnifierUIWnd - the main UI window
+        // Let everything else (MagUIClass, GDI+, etc.) be created normally
+        if (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) {
             isMagnifierClass = TRUE;
             dwStyle &= ~WS_VISIBLE;
             dwExStyle &= ~WS_EX_APPWINDOW;
             dwExStyle |= WS_EX_TOOLWINDOW;
-            Wh_Log(L"Magnifier Headless: Intercepting UI window creation (%ls)", lpClassName);
+            Wh_Log(L"Magnifier Headless: Intercepting ScreenMagnifierUIWnd creation");
         }
     }
 
@@ -656,17 +650,15 @@ static BOOL CALLBACK EnumWindowsHideCallback(HWND hwnd, LPARAM lParam) {
         return TRUE; // Continue enumeration
     }
 
-    // ONLY hide UI windows, NOT functional windows
-    // Be very specific to avoid breaking zoom functionality
+    // ONLY hide ScreenMagnifierUIWnd - the main UI control panel
+    // Let everything else exist normally (may be needed for functionality)
     BOOL shouldHide = FALSE;
-    if (wcscmp(className, L"ScreenMagnifierUIWnd") == 0 ||
-        wcsstr(className, L"GDI+") != NULL ||
-        wcsstr(className, L"CspNotify") != NULL ||
-        wcscmp(className, L"Magnifier Touch") == 0) {
+    if (wcscmp(className, L"ScreenMagnifierUIWnd") == 0) {
         shouldHide = TRUE;
     }
 
-    // DO NOT HIDE: MagUIClass - this is needed for zoom to work!
+    // DO NOT HIDE: MagUIClass, GDI+, CspNotify, Magnifier Touch
+    // These windows may be necessary for Magnifier to function
 
     if (shouldHide) {
         DWORD windowProcessId = 0;
