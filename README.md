@@ -17,14 +17,15 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 
 ## Technical Details
 
-**Version**: 1.3.1
+**Version**: 1.3.2
 
-**Latest Changes (v1.3.1)**:
-- **ELIMINATED MOUSE FREEZE**: Removed blocking initial cleanup, timer handles everything
-- **ULTRA-FAST RESPONSE**: Timer interval reduced to 10ms (was 500ms) - windows vanish instantly
-- **NEW WINDOW CLASS**: Added "Magnifier Touch" detection and hiding
-- **OPTIMIZED LOGGING**: Disabled verbose logging from timer to prevent performance impact
-- Timer starts before initialization completes (non-blocking, immediate coverage)
+**Latest Changes (v1.3.2)**:
+- **NUCLEAR OPTION**: DestroyWindow() now called on all Magnifier windows (aggressive removal)
+- **WILDCARD SEARCH**: Using wcsstr() instead of exact match (catches variations like "GDI+ Window Class")
+- **FULL SYSTEM SCAN**: EnumWindows instead of FindWindowExW (scans ALL windows, not just by class)
+- **1ms TIMER**: Ultra-aggressive 1ms cleanup interval (1000 checks/second)
+- **DEBUG LOGGING**: First 20 cleanup passes logged for troubleshooting
+- Removed g_lInitialized check from timer (runs immediately on start)
 
 **Previous Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
