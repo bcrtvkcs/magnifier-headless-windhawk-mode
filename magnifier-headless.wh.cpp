@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.2.1
+// @version         1.2.2
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -232,14 +232,8 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
         return FALSE;
     }
 
-    // Fast path: Process ID check (if available)
-    if (g_dwMagnifyProcessId != 0) {
-        DWORD dwProcessId = 0;
-        GetWindowThreadProcessId(hwnd, &dwProcessId);
-        if (dwProcessId != g_dwMagnifyProcessId) {
-            return FALSE; // Different process, definitely not Magnifier
-        }
-    }
+    // Note: Removed process ID filtering to allow detection of helper windows
+    // created by other Windows processes (CSPNotify, MSCTFIME, etc.)
 
     // Fast path: Check cache first (thread-safe with minimal locking)
     DWORD currentTick = GetTickCount();
@@ -270,6 +264,9 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
         isMagnifier = TRUE;
     } else if (wcsstr(className, L"CSPNotify") != NULL) {
         // CSPNotify windows
+        isMagnifier = TRUE;
+    } else if (wcsstr(className, L"MSCTFIME") != NULL) {
+        // MSCTFIME UI (Input Method Editor helper window)
         isMagnifier = TRUE;
     }
 
@@ -610,7 +607,8 @@ HWND WINAPI CreateWindowExW_Hook(
         if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"MagUIClass") == 0) ||
             (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
             wcsncmp(lpClassName, L"GDI+", 4) == 0 ||
-            wcsstr(lpClassName, L"CSPNotify") != NULL) {
+            wcsstr(lpClassName, L"CSPNotify") != NULL ||
+            wcsstr(lpClassName, L"MSCTFIME") != NULL) {
             isMagnifierClass = TRUE;
             dwStyle &= ~WS_VISIBLE;
             dwExStyle &= ~WS_EX_APPWINDOW;
@@ -647,6 +645,30 @@ HWND WINAPI CreateWindowExW_Hook(
     return hwnd;
 }
 
+// --- HELPER FUNCTION FOR EXISTING WINDOWS ---
+
+// Enumerate and hide existing magnifier-related windows
+BOOL CALLBACK EnumWindowsProc_HideMagnifierWindows(HWND hwnd, LPARAM lParam) {
+    if (IsMagnifierWindow(hwnd)) {
+        Wh_Log(L"Magnifier Headless: Found existing magnifier window (HWND: 0x%p), hiding...", hwnd);
+
+        // Hide window if detected
+        if (ShowWindow_Original && SafeIsWindow(hwnd)) {
+            ShowWindow_Original(hwnd, SW_HIDE);
+        }
+
+        // Update styles to prevent visibility
+        if (SetWindowLongPtrW_Original && SafeIsWindow(hwnd)) {
+            LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SafeSetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_VISIBLE);
+
+            LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SafeSetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+        }
+    }
+    return TRUE; // Continue enumeration
+}
 
 // --- MOD INITIALIZATION ---
 
@@ -769,6 +791,10 @@ BOOL Wh_ModInit() {
 
     // Mark initialization as complete (atomic operation)
     InterlockedExchange(&g_lInitialized, 1);
+
+    // Enumerate and hide any existing magnifier windows that were created before mod loaded
+    Wh_Log(L"Magnifier Headless: Enumerating existing windows to hide any magnifier-related windows...");
+    EnumWindows(EnumWindowsProc_HideMagnifierWindows, 0);
 
     Wh_Log(L"Magnifier Headless: Initialization complete. All systems ready.");
     return TRUE;
