@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.2.2
+// @version         1.3.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -105,6 +105,11 @@ volatile LONG g_lInitialized = 0;
 
 // Process ID of magnify.exe for fast filtering
 DWORD g_dwMagnifyProcessId = 0;
+
+// Timer for periodic window cleanup
+UINT_PTR g_hCleanupTimer = 0;
+#define CLEANUP_TIMER_ID 1
+#define CLEANUP_INTERVAL_MS 500  // Check every 500ms
 
 // HWND cache for fast magnifier window detection (protected by g_csGlobalState)
 #define MAX_CACHED_MAGNIFIER_WINDOWS 16
@@ -639,25 +644,58 @@ HWND WINAPI CreateWindowExW_Hook(
 
 // --- MOD INITIALIZATION ---
 
-// Callback for EnumThreadWindows to hide existing Magnifier windows
-static BOOL CALLBACK HideExistingMagnifierWindowsCallback(HWND hwnd, LPARAM lParam) {
-    int* pCount = (int*)lParam;
-    if (IsMagnifierWindow(hwnd)) {
-        Wh_Log(L"Magnifier Headless: Found existing Magnifier window (HWND: 0x%p)", hwnd);
+// Aggressively hide all Magnifier-related windows by class name
+static void HideAllMagnifierWindows() {
+    static const wchar_t* magnifierClasses[] = {
+        L"MagUIClass",
+        L"ScreenMagnifierUIWnd",
+        L"GDI+ Window",
+        L"CspNotify Notify Window"
+    };
 
-        // Hide it immediately
-        ShowWindow(hwnd, SW_HIDE);
+    int totalHidden = 0;
+    DWORD currentProcessId = GetCurrentProcessId();
 
-        // Update styles
-        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_VISIBLE);
+    for (int i = 0; i < 4; i++) {
+        HWND hwnd = NULL;
+        // Find all windows with this class name
+        while ((hwnd = FindWindowExW(NULL, hwnd, magnifierClasses[i], NULL)) != NULL) {
+            // Check if it belongs to our process
+            DWORD windowProcessId = 0;
+            GetWindowThreadProcessId(hwnd, &windowProcessId);
 
-        LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+            if (windowProcessId == currentProcessId) {
+                Wh_Log(L"Magnifier Headless: Aggressively hiding window class '%ls' (HWND: 0x%p)",
+                       magnifierClasses[i], hwnd);
 
-        (*pCount)++;
+                // Immediate hide
+                ShowWindow(hwnd, SW_HIDE);
+
+                // Force styles
+                LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_VISIBLE);
+
+                LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (exStyle & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+
+                // Try to destroy it (last resort)
+                // DestroyWindow(hwnd);
+
+                totalHidden++;
+            }
+        }
     }
-    return TRUE; // Continue enumeration
+
+    if (totalHidden > 0) {
+        Wh_Log(L"Magnifier Headless: Cleanup pass hidden %d window(s)", totalHidden);
+    }
+}
+
+// Timer callback for periodic window cleanup
+static VOID CALLBACK CleanupTimerCallback(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
+    if (!g_lInitialized) return;
+
+    HideAllMagnifierWindows();
 }
 
 BOOL Wh_ModInit() {
@@ -780,14 +818,18 @@ BOOL Wh_ModInit() {
     // Mark initialization as complete (atomic operation)
     InterlockedExchange(&g_lInitialized, 1);
 
-    // Hide any existing Magnifier windows that were created before hooks
-    Wh_Log(L"Magnifier Headless: Scanning for existing Magnifier windows...");
-    int hiddenCount = 0;
+    // Aggressively hide any existing Magnifier windows
+    Wh_Log(L"Magnifier Headless: Initial cleanup pass...");
+    HideAllMagnifierWindows();
 
-    // Enumerate all windows in current thread
-    EnumThreadWindows(GetCurrentThreadId(), HideExistingMagnifierWindowsCallback, (LPARAM)&hiddenCount);
+    // Start periodic cleanup timer (catches windows that appear later)
+    g_hCleanupTimer = SetTimer(NULL, CLEANUP_TIMER_ID, CLEANUP_INTERVAL_MS, CleanupTimerCallback);
+    if (g_hCleanupTimer) {
+        Wh_Log(L"Magnifier Headless: Cleanup timer started (every %dms)", CLEANUP_INTERVAL_MS);
+    } else {
+        Wh_Log(L"Magnifier Headless: Warning - Failed to start cleanup timer");
+    }
 
-    Wh_Log(L"Magnifier Headless: Hidden %d existing window(s).", hiddenCount);
     Wh_Log(L"Magnifier Headless: Initialization complete. All systems ready.");
     return TRUE;
 }
@@ -797,6 +839,13 @@ void Wh_ModUninit() {
 
     // Mark as uninitialized (atomic operation)
     InterlockedExchange(&g_lInitialized, 0);
+
+    // Stop cleanup timer
+    if (g_hCleanupTimer) {
+        KillTimer(NULL, g_hCleanupTimer);
+        g_hCleanupTimer = 0;
+        Wh_Log(L"Magnifier Headless: Cleanup timer stopped.");
+    }
 
     // Unhook window procedure hook
     if (g_hCallWndProcHook) {
