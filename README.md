@@ -17,14 +17,14 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 
 ## Technical Details
 
-**Version**: 1.3.0
+**Version**: 1.2.2
 
-**Latest Changes (v1.3.0)**:
-- **AGGRESSIVE FIX**: Direct FindWindowExW search for all Magnifier window classes (GDI+, CspNotify, etc.)
-- **PERSISTENT SOLUTION**: 500ms timer-based cleanup to catch windows that appear late
-- **NO MORE BLOCKING**: Removed EnumThreadWindows, using direct window search instead
-- **GUARANTEED HIDING**: All windows found by class name are immediately hidden, no exceptions
-- Searches entire process, not just current thread (catches all windows)
+**Latest Changes (v1.2.2)**:
+- **CRITICAL FIX**: Removed process ID filtering that was blocking GDI+ and CspNotify windows
+- **CRITICAL FIX**: Enumerate and hide existing windows on initialization (catches pre-existing windows)
+- **PERFORMANCE FIX**: Removed blocking SetParent retry mechanism (eliminated 5-6 second mouse freeze)
+- Optimized window hiding order: ShowWindow first, then style changes (faster)
+- Increased className buffer to 64 chars (was 32, too small for "CspNotify Notify Window")
 
 **Previous Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
