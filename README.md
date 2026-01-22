@@ -11,13 +11,15 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 - **Complete UI Hiding**: Prevents Magnifier window from ever appearing
 - **Keyboard Shortcuts Preserved**: Win + Plus and Win + Minus still work perfectly
 - **No Taskbar Icon**: Magnifier won't show up in your taskbar
+- **Fixes Mouse Cursor Freeze**: Eliminates the 5-6 second mouse cursor freeze that occurs when Magnifier touch controls appear on startup (a known Windows Magnifier bug affecting users even without touch devices)
+- **Blocks Touch Interface**: Completely hides the Magnifier touch controls (semi-transparent squares with black borders that appear at screen corners), which are unnecessary for non-touch users
 - **Thread-Safe**: Robust implementation with race condition protection
 - **High Performance**: Optimized with LRU cache and fast-path filtering
 - **Comprehensive Coverage**: Hooks 11 Windows APIs for complete control
 
 ## Technical Details
 
-**Version**: 1.2.0
+**Version**: 1.3.0
 
 **Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
