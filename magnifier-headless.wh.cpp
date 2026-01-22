@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.2.2
+// @version         1.2.3
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -262,8 +262,8 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     } else if (wcsncmp(className, L"GDI+", 4) == 0) {
         // GDI+ helper windows (e.g., "GDI+ Hook Window Class")
         isMagnifier = TRUE;
-    } else if (wcsstr(className, L"CSPNotify") != NULL) {
-        // CSPNotify windows
+    } else if (wcsstr(className, L"CSpNotify") != NULL) {
+        // CSpNotify windows (C uppercase, S uppercase, p lowercase)
         isMagnifier = TRUE;
     } else if (wcsstr(className, L"MSCTFIME") != NULL) {
         // MSCTFIME UI (Input Method Editor helper window)
@@ -607,7 +607,7 @@ HWND WINAPI CreateWindowExW_Hook(
         if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"MagUIClass") == 0) ||
             (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
             wcsncmp(lpClassName, L"GDI+", 4) == 0 ||
-            wcsstr(lpClassName, L"CSPNotify") != NULL ||
+            wcsstr(lpClassName, L"CSpNotify") != NULL ||
             wcsstr(lpClassName, L"MSCTFIME") != NULL) {
             isMagnifierClass = TRUE;
             dwStyle &= ~WS_VISIBLE;
