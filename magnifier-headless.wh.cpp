@@ -496,7 +496,8 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd, DWORD dwAttribute, LPCVOID 
 
 // Subclassed window procedure for Magnifier window
 // Uses WindhawkUtils::SetWindowSubclassFromAnyThread for safe multi-mod subclassing
-LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+// Note: WindhawkUtils uses a 5-parameter callback signature (without uIdSubclass)
+LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, DWORD_PTR dwRefData) {
     // Validate window handle
     if (!SafeIsWindow(hWnd)) {
         return DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -881,21 +882,14 @@ void Wh_ModUninit() {
         Wh_Log(L"Magnifier Headless: Window procedure hook removed.");
     }
 
-    // Remove window subclass if applied
-    HWND hSubclassedWnd = NULL;
+    // Clear subclass tracking
+    // Note: WindhawkUtils::SetWindowSubclassFromAnyThread handles cleanup automatically
+    // when the mod is unloaded or the window is destroyed
     {
         AutoCriticalSection lock(&g_csGlobalState);
-        hSubclassedWnd = g_hSubclassedMagnifierWnd;
-        g_hSubclassedMagnifierWnd = NULL;
-    }
-
-    if (hSubclassedWnd && SafeIsWindow(hSubclassedWnd)) {
-        // Remove subclass using the same procedure and ID (0) used when setting
-        if (RemoveWindowSubclass(hSubclassedWnd, MagnifierWndProc_Hook, 0)) {
-            Wh_Log(L"Magnifier Headless: Removed subclass from HWND 0x%p", hSubclassedWnd);
-        } else if (LOG_ERROR_DETAILS) {
-            Wh_Log(L"Magnifier Headless: Failed to remove subclass from HWND 0x%p (error: %lu)",
-                   hSubclassedWnd, GetLastError());
+        if (g_hSubclassedMagnifierWnd) {
+            Wh_Log(L"Magnifier Headless: Subclass will be removed automatically (HWND: 0x%p)", g_hSubclassedMagnifierWnd);
+            g_hSubclassedMagnifierWnd = NULL;
         }
     }
 
