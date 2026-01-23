@@ -17,10 +17,6 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 - **High Performance**: Optimized with LRU cache and fast-path filtering
 - **Comprehensive Coverage**: Hooks 11 Windows APIs for complete control
 
-## Technical Details
-
-**Version**: 1.3.6
-
 **Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
 - 11 API hooks for complete window visibility control
