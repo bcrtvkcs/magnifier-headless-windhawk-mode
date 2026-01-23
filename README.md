@@ -47,3 +47,6 @@ Simply use the standard Windows Magnifier keyboard shortcuts:
 - **Win + Esc**: Exit Magnifier
 
 The Magnifier window will remain completely hidden while all functionality works normally.
+
+## License
+All rights reserved. No license specified.
