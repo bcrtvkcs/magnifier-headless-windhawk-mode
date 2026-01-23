@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.3.4
+// @version         1.3.3
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -398,14 +398,9 @@ BOOL WINAPI UpdateLayeredWindow_Hook(
                                               hdcSrc, pptSrc, crKey, pblend, dwFlags) : FALSE;
     }
 
-    // For touch overlay: Let updates pass through (alpha=0 keeps it invisible)
-    // Blocking updates causes initialization delays
+    // For touch overlay: Block updates to keep it transparent
     if (IsTouchOverlayWindow(hWnd)) {
-        // Modify blend function to force full transparency if provided
-        BLENDFUNCTION transparentBlend = {AC_SRC_OVER, 0, 0, AC_SRC_ALPHA};
-        return UpdateLayeredWindow_Original(hWnd, hdcDst, pptDst, psize,
-                                           hdcSrc, pptSrc, crKey,
-                                           pblend ? &transparentBlend : NULL, dwFlags);
+        return TRUE; // Pretend success but don't actually update
     }
 
     if (IsMagnifierWindow(hWnd)) {
