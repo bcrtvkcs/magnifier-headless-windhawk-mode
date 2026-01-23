@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         1.3.2
+// @version         1.3.3
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -272,15 +272,8 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
         isMagnifier = TRUE;
     }
 
-    // If not detected by class name, check window title for touch controls
-    if (!isMagnifier) {
-        wchar_t windowTitle[64] = {0};
-        if (GetWindowTextW(hwnd, windowTitle, 64) > 0) {
-            if (wcsstr(windowTitle, L"Magnifier Touch") != NULL) {
-                isMagnifier = TRUE;
-            }
-        }
-    }
+    // NOTE: "Magnifier Touch" windows are handled separately via IsTouchOverlayWindow()
+    // to make them transparent instead of hidden (preserves zoom functionality)
 
     // Add to cache with LRU eviction (thread-safe)
     {
@@ -309,6 +302,20 @@ inline BOOL IsMagnifierWindow(HWND hwnd) {
     return isMagnifier;
 }
 
+// Check if a window is the Magnifier Touch overlay (handled differently - made transparent, not hidden)
+inline BOOL IsTouchOverlayWindow(HWND hwnd) {
+    if (!hwnd) {
+        return FALSE;
+    }
+    wchar_t windowTitle[64] = {0};
+    if (GetWindowTextW(hwnd, windowTitle, 64) > 0) {
+        if (wcsstr(windowTitle, L"Magnifier Touch") != NULL) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 // --- HOOKS ---
 
 // ShowWindow hook to catch attempts to show the Magnifier window
@@ -318,6 +325,11 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
     // Fast path: Check initialization once
     if (!g_lInitialized) {
         return ShowWindow_Original ? ShowWindow_Original(hWnd, nCmdShow) : FALSE;
+    }
+
+    // Skip touch overlay windows - let them show (they're made transparent instead)
+    if (IsTouchOverlayWindow(hWnd)) {
+        return ShowWindow_Original(hWnd, nCmdShow);
     }
 
     if (IsMagnifierWindow(hWnd) && nCmdShow != SW_HIDE) {
@@ -334,6 +346,11 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int
         return SetWindowPos_Original ? SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags) : FALSE;
     }
 
+    // Skip touch overlay windows - let them position normally (they're made transparent instead)
+    if (IsTouchOverlayWindow(hWnd)) {
+        return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+    }
+
     if (IsMagnifierWindow(hWnd)) {
         uFlags &= ~SWP_SHOWWINDOW;
         uFlags |= SWP_HIDEWINDOW;
@@ -347,6 +364,14 @@ SetWindowLongPtrW_t SetWindowLongPtrW_Original = nullptr;
 LONG_PTR WINAPI SetWindowLongPtrW_Hook(HWND hWnd, int nIndex, LONG_PTR dwNewLong) {
     if (!g_lInitialized) {
         return SetWindowLongPtrW_Original ? SetWindowLongPtrW_Original(hWnd, nIndex, dwNewLong) : 0;
+    }
+
+    // For touch overlay: Preserve WS_EX_LAYERED to keep it transparent
+    if (IsTouchOverlayWindow(hWnd)) {
+        if (nIndex == GWL_EXSTYLE) {
+            dwNewLong |= WS_EX_LAYERED; // Ensure layered style is preserved
+        }
+        return SetWindowLongPtrW_Original(hWnd, nIndex, dwNewLong);
     }
 
     if (IsMagnifierWindow(hWnd)) {
@@ -373,6 +398,11 @@ BOOL WINAPI UpdateLayeredWindow_Hook(
                                               hdcSrc, pptSrc, crKey, pblend, dwFlags) : FALSE;
     }
 
+    // For touch overlay: Block updates to keep it transparent
+    if (IsTouchOverlayWindow(hWnd)) {
+        return TRUE; // Pretend success but don't actually update
+    }
+
     if (IsMagnifierWindow(hWnd)) {
         return TRUE; // Pretend success
     }
@@ -385,6 +415,11 @@ SetLayeredWindowAttributes_t SetLayeredWindowAttributes_Original = nullptr;
 BOOL WINAPI SetLayeredWindowAttributes_Hook(HWND hWnd, COLORREF crKey, BYTE bAlpha, DWORD dwFlags) {
     if (!g_lInitialized) {
         return SetLayeredWindowAttributes_Original ? SetLayeredWindowAttributes_Original(hWnd, crKey, bAlpha, dwFlags) : FALSE;
+    }
+
+    // For touch overlay: Force alpha=0 to keep it transparent
+    if (IsTouchOverlayWindow(hWnd)) {
+        return SetLayeredWindowAttributes_Original(hWnd, 0, 0, LWA_ALPHA);
     }
 
     if (IsMagnifierWindow(hWnd)) {
@@ -614,7 +649,16 @@ HWND WINAPI CreateWindowExW_Hook(
     }
 
     BOOL isMagnifierClass = FALSE;
-    if (((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
+    BOOL isTouchOverlay = FALSE;
+
+    // Check for touch overlay first (by window title)
+    if (lpWindowName && wcsstr(lpWindowName, L"Magnifier Touch") != NULL) {
+        isTouchOverlay = TRUE;
+        Wh_Log(L"Magnifier Headless: Detected Magnifier Touch window (title: %ls) - will make transparent", lpWindowName);
+    }
+
+    // Check for other magnifier classes (only if not touch overlay)
+    if (!isTouchOverlay && ((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0) {
         // Optimized: Check first character before full string comparison
         if ((lpClassName[0] == L'M' && wcscmp(lpClassName, L"MagUIClass") == 0) ||
             (lpClassName[0] == L'S' && wcscmp(lpClassName, L"ScreenMagnifierUIWnd") == 0) ||
@@ -629,19 +673,22 @@ HWND WINAPI CreateWindowExW_Hook(
         }
     }
 
-    // Also check window title for "Magnifier Touch" controls
-    if (!isMagnifierClass && lpWindowName && wcsstr(lpWindowName, L"Magnifier Touch") != NULL) {
-        isMagnifierClass = TRUE;
-        dwStyle &= ~WS_VISIBLE;
-        dwExStyle &= ~WS_EX_APPWINDOW;
-        dwExStyle |= WS_EX_TOOLWINDOW;
-        Wh_Log(L"Magnifier Headless: Intercepting Magnifier Touch window (title: %ls)", lpWindowName);
-    }
-
     HWND hwnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y,
                                   nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 
-    if (hwnd && isMagnifierClass) {
+    if (hwnd && isTouchOverlay) {
+        // For touch overlay: Make it fully transparent (alpha=0) instead of hiding
+        // This preserves zoom functionality while making the overlay invisible
+        LONG_PTR currentExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SafeSetWindowLongPtrW(hwnd, GWL_EXSTYLE, currentExStyle | WS_EX_LAYERED);
+
+        // Set alpha to 0 (fully transparent) - use original function to bypass our hook
+        if (SetLayeredWindowAttributes_Original) {
+            SetLayeredWindowAttributes_Original(hwnd, 0, 0, LWA_ALPHA);
+            Wh_Log(L"Magnifier Headless: Made Magnifier Touch window fully transparent (HWND: 0x%p)", hwnd);
+        }
+    } else if (hwnd && isMagnifierClass) {
+        // For other magnifier windows: Hide completely
         // Fast path: Read g_hHostWnd without lock (it's stable after init)
         HWND hostWnd = g_hHostWnd;
         if (hostWnd && SafeIsWindow(hostWnd)) {
