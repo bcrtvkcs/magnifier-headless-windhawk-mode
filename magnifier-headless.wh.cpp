@@ -496,10 +496,10 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd, DWORD dwAttribute, LPCVOID 
 
 // Subclassed window procedure for Magnifier window
 // Uses WindhawkUtils::SetWindowSubclassFromAnyThread for safe multi-mod subclassing
-LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, DWORD_PTR dwRefData) {
+LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     // Validate window handle
     if (!SafeIsWindow(hWnd)) {
-        return 0;
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
     }
 
     // Fast path: Handle high-frequency messages without logging
