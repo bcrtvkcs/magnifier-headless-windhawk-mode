@@ -368,7 +368,11 @@ LONG_PTR WINAPI SetWindowLongPtrW_Hook(HWND hWnd, int nIndex, LONG_PTR dwNewLong
         return SetWindowLongPtrW_Original ? SetWindowLongPtrW_Original(hWnd, nIndex, dwNewLong) : 0;
     }
 
-    // Touch overlay is handled via off-screen positioning, no special style handling needed
+    // Touch overlay: Enforce WS_EX_TOOLWINDOW to hide from Alt+Tab
+    if (IsTouchOverlayWindow(hWnd) && nIndex == GWL_EXSTYLE) {
+        dwNewLong &= ~WS_EX_APPWINDOW;
+        dwNewLong |= WS_EX_TOOLWINDOW;
+    }
 
     if (IsMagnifierWindow(hWnd)) {
         if (nIndex == GWL_STYLE) {
@@ -655,7 +659,10 @@ HWND WINAPI CreateWindowExW_Hook(
     // Check for touch overlay first (by window title)
     if (lpWindowName && wcsstr(lpWindowName, L"Magnifier Touch") != NULL) {
         isTouchOverlay = TRUE;
-        Wh_Log(L"Magnifier Headless: Detected Magnifier Touch window (title: %ls) - will move off-screen + 0x0 size", lpWindowName);
+        // Hide from Alt+Tab and Task Manager
+        dwExStyle &= ~WS_EX_APPWINDOW;
+        dwExStyle |= WS_EX_TOOLWINDOW;
+        Wh_Log(L"Magnifier Headless: Detected Magnifier Touch window (title: %ls) - hiding from Alt+Tab", lpWindowName);
     }
 
     // Check for other magnifier classes (only if not touch overlay)
