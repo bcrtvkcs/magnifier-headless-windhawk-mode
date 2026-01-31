@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.9.6.1
+// @version         0.9.6.2
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -146,17 +146,17 @@ HWND g_hSubclassedMagnifierWnd = NULL;
 // CRASH PROTECTION STATE
 // ===========================
 
-// Flag indicating whether __security_check_cookie was successfully hooked
-volatile BOOL g_bCookieCheckHooked = FALSE;
+// Flag indicating whether __security_check_cookie was successfully patched
+volatile BOOL g_bCookieCheckPatched = FALSE;
 
-// Address of __security_check_cookie function (for diagnostic logging)
-volatile PVOID g_pSecurityCheckCookie = NULL;
-
-// Address of __security_cookie variable (for mismatch detection in hook)
+// Address of __security_cookie variable (for diagnostics)
 volatile PVOID g_pSecurityCookieAddr = NULL;
 
-// Counter of intercepted GS cookie mismatches (for diagnostics)
-volatile LONG g_lGSFailureCount = 0;
+// Saved original bytes for restoration on mod unload
+#define MAX_COOKIE_PATCH_SIZE 16
+BYTE g_originalCookieBytes[MAX_COOKIE_PATCH_SIZE] = {0};
+DWORD g_cookiePatchSize = 0;
+BYTE* g_pCookiePatchAddr = NULL;
 
 // Helper: Safe enter/leave critical section
 class AutoCriticalSection {
@@ -267,8 +267,9 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
 // 4. Return the address of the CMP instruction (start of __security_check_cookie)
 //
 // Modern MSVC may inline __fastfail (int 0x29) directly into this function,
-// so there may be no separate __report_gsfailure to hook. By hooking
-// __security_check_cookie itself, we intercept BEFORE int 0x29 fires.
+// so there may be no separate __report_gsfailure to hook. By patching
+// __security_check_cookie directly (NOP out the branch + int 0x29), we
+// prevent __fastfail from ever firing.
 static PVOID FindSecurityCheckCookie() {
     HMODULE hModule = GetModuleHandle(NULL);
     if (!hModule) {
@@ -318,7 +319,7 @@ static PVOID FindSecurityCheckCookie() {
         return NULL;
     }
 
-    // Store for use by the hook function
+    // Store for diagnostics
     g_pSecurityCookieAddr = (PVOID)securityCookieVA;
     Wh_Log(L"Crash Protection: __security_cookie at 0x%llX", securityCookieVA);
 
@@ -400,31 +401,113 @@ static PVOID FindSecurityCheckCookie() {
     return pFoundCheckCookie;
 }
 
-// --- __security_check_cookie Hook ---
+// --- Direct Binary Patch ---
+// NOP out the conditional branch and __fastfail inside __security_check_cookie.
+// After patch: CMP (harmless) -> NOP... -> RET (always returns normally).
+// No MinHook/trampoline involved - just direct byte modification.
 
-typedef void (__cdecl *SecurityCheckCookie_t)(uintptr_t);
-SecurityCheckCookie_t SecurityCheckCookie_Original = nullptr;
+static BOOL PatchSecurityCheckCookie(BYTE* pFunc) {
+    BYTE* pAfterCmp = pFunc + 7;  // Skip the 7-byte CMP instruction
 
-// Replaces __security_check_cookie: validates the cookie but returns normally
-// on mismatch instead of calling __fastfail / __report_gsfailure.
-// This prevents STATUS_STACK_BUFFER_OVERRUN process termination.
-void __cdecl SecurityCheckCookie_Hook(uintptr_t stackCookie) {
-    // Hot path: check if cookie matches (99.99% of calls)
-    if (g_pSecurityCookieAddr) {
-        uintptr_t expected = *(volatile uintptr_t*)g_pSecurityCookieAddr;
-        if (stackCookie == expected) {
-            return;  // Valid cookie, return immediately
+    // Scan forward (up to 16 bytes) to find RET (C3) or REP RET (F3 C3)
+    BYTE* pRet = NULL;
+    for (int i = 0; i < MAX_COOKIE_PATCH_SIZE; i++) {
+        if (pAfterCmp[i] == 0xF3 && (i + 1) < MAX_COOKIE_PATCH_SIZE && pAfterCmp[i + 1] == 0xC3) {
+            pRet = &pAfterCmp[i];  // REP RET
+            break;
         }
-        // Mismatch detected - log but DON'T crash
-        LONG count = InterlockedIncrement(&g_lGSFailureCount);
-        if (count <= 10) {
-            Wh_Log(L"Crash Protection: GS cookie mismatch #%ld on thread %lu "
-                    L"(expected 0x%llX, got 0x%llX)",
-                    count, GetCurrentThreadId(),
-                    (ULONGLONG)expected, (ULONGLONG)stackCookie);
+        if (pAfterCmp[i] == 0xC3) {
+            pRet = &pAfterCmp[i];  // RET
+            break;
         }
     }
-    // Return normally in ALL cases - never crash
+
+    if (!pRet) {
+        Wh_Log(L"Crash Protection: Could not find RET in __security_check_cookie");
+        return FALSE;
+    }
+
+    // Calculate how many bytes to NOP (from after CMP to before RET)
+    DWORD patchSize = (DWORD)(pRet - pAfterCmp);
+    if (patchSize == 0 || patchSize > MAX_COOKIE_PATCH_SIZE) {
+        Wh_Log(L"Crash Protection: Invalid patch size: %lu", patchSize);
+        return FALSE;
+    }
+
+    // Also check for INT 29h (CD 29) after the RET and NOP those too
+    DWORD totalPatchSize = patchSize;
+    BYTE* pAfterRet = pRet + 1;
+    if (pAfterRet[0] == 0xF3 && pAfterRet[1] == 0xC3) {
+        pAfterRet = pRet + 2;  // Skip REP RET
+    }
+    if (pAfterRet[0] == 0xCD && pAfterRet[1] == 0x29) {
+        // INT 29h found after RET - include it in patch
+        totalPatchSize = (DWORD)(pAfterRet + 2 - pAfterCmp);
+    }
+
+    Wh_Log(L"Crash Protection: Patching %lu bytes at 0x%p (RET at offset +%lu)",
+            totalPatchSize, pAfterCmp, patchSize);
+
+    // Save original bytes for restoration
+    memcpy(g_originalCookieBytes, pAfterCmp, totalPatchSize);
+    g_cookiePatchSize = totalPatchSize;
+    g_pCookiePatchAddr = pAfterCmp;
+
+    // Make memory writable
+    DWORD oldProtect;
+    if (!VirtualProtect(pAfterCmp, totalPatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Wh_Log(L"Crash Protection: VirtualProtect failed (error: %lu)", GetLastError());
+        return FALSE;
+    }
+
+    // NOP everything from after CMP to before RET
+    for (DWORD i = 0; i < patchSize; i++) {
+        pAfterCmp[i] = 0x90;  // NOP
+    }
+
+    // NOP any INT 29h after the RET (dead code cleanup)
+    for (DWORD i = patchSize + 1; i < totalPatchSize; i++) {
+        // Skip the RET byte itself
+        if (pAfterCmp[i] == 0xC3 || (pAfterCmp[i] == 0xF3 && pAfterCmp[i + 1] == 0xC3)) {
+            continue;
+        }
+        pAfterCmp[i] = 0x90;  // NOP
+    }
+
+    // Restore original memory protection
+    VirtualProtect(pAfterCmp, totalPatchSize, oldProtect, &oldProtect);
+
+    // Flush instruction cache
+    FlushInstructionCache(GetCurrentProcess(), pAfterCmp, totalPatchSize);
+
+    // Log the patched bytes
+    Wh_Log(L"Crash Protection: Patched bytes: "
+            L"%02X %02X %02X %02X %02X %02X %02X %02X "
+            L"%02X %02X %02X %02X %02X %02X %02X %02X",
+            pAfterCmp[0], pAfterCmp[1], pAfterCmp[2], pAfterCmp[3],
+            pAfterCmp[4], pAfterCmp[5], pAfterCmp[6], pAfterCmp[7],
+            pAfterCmp[8], pAfterCmp[9], pAfterCmp[10], pAfterCmp[11],
+            pAfterCmp[12], pAfterCmp[13], pAfterCmp[14], pAfterCmp[15]);
+
+    return TRUE;
+}
+
+static void RestoreSecurityCheckCookie() {
+    if (!g_pCookiePatchAddr || g_cookiePatchSize == 0) {
+        return;
+    }
+
+    DWORD oldProtect;
+    if (VirtualProtect(g_pCookiePatchAddr, g_cookiePatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        memcpy(g_pCookiePatchAddr, g_originalCookieBytes, g_cookiePatchSize);
+        VirtualProtect(g_pCookiePatchAddr, g_cookiePatchSize, oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), g_pCookiePatchAddr, g_cookiePatchSize);
+        Wh_Log(L"Crash Protection: Restored original __security_check_cookie bytes (%lu bytes)",
+                g_cookiePatchSize);
+    }
+
+    g_pCookiePatchAddr = NULL;
+    g_cookiePatchSize = 0;
 }
 
 // --- Error Suppression ---
@@ -989,27 +1072,24 @@ BOOL Wh_ModInit() {
     // Always install error suppression (suppress csrss hard error dialog)
     InstallErrorSuppression();
 
-    // Try to find and hook __security_check_cookie in magnify.exe PE image
+    // Try to find and patch __security_check_cookie in magnify.exe PE image
     PVOID pCheckCookie = FindSecurityCheckCookie();
     if (pCheckCookie) {
-        g_pSecurityCheckCookie = pCheckCookie;
-        Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p, installing hook...",
+        Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p, applying patch...",
                 pCheckCookie);
 
-        if (Wh_SetFunctionHook(pCheckCookie,
-                                (void*)SecurityCheckCookie_Hook,
-                                (void**)&SecurityCheckCookie_Original)) {
-            g_bCookieCheckHooked = TRUE;
-            Wh_Log(L"Crash Protection: __security_check_cookie hook installed successfully!");
+        if (PatchSecurityCheckCookie((BYTE*)pCheckCookie)) {
+            g_bCookieCheckPatched = TRUE;
+            Wh_Log(L"Crash Protection: __security_check_cookie patched successfully!");
         } else {
-            Wh_Log(L"Crash Protection: WARNING - Failed to hook __security_check_cookie.");
+            Wh_Log(L"Crash Protection: WARNING - Failed to patch __security_check_cookie.");
         }
     } else {
         Wh_Log(L"Crash Protection: WARNING - Could not find __security_check_cookie in PE image.");
     }
 
-    Wh_Log(L"Crash Protection: Setup complete (cookie check hook: %s).",
-            g_bCookieCheckHooked ? L"YES" : L"NO");
+    Wh_Log(L"Crash Protection: Setup complete (cookie check patched: %s).",
+            g_bCookieCheckPatched ? L"YES" : L"NO");
 
     // Set up all hooks BEFORE creating windows to prevent race conditions
     Wh_Log(L"Magnifier Headless: Setting up function hooks...");
@@ -1131,15 +1211,12 @@ void Wh_ModUninit() {
     // Mark as uninitialized (atomic operation)
     InterlockedExchange(&g_lInitialized, 0);
 
-    // Log crash protection statistics
-    if (g_bCookieCheckHooked || g_lGSFailureCount > 0) {
-        Wh_Log(L"Crash Protection: Uninitializing. Total GS cookie mismatches intercepted: %ld",
-                g_lGSFailureCount);
+    // Restore original __security_check_cookie bytes
+    if (g_bCookieCheckPatched) {
+        RestoreSecurityCheckCookie();
+        g_bCookieCheckPatched = FALSE;
     }
-    g_bCookieCheckHooked = FALSE;
-    g_pSecurityCheckCookie = NULL;
     g_pSecurityCookieAddr = NULL;
-    // Note: Wh_SetFunctionHook hooks are automatically removed by Windhawk
 
     // Unhook window procedure hook
     if (g_hCallWndProcHook) {
