@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.9.5.4
+// @version         0.9.6.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -99,6 +99,10 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
 
 #pragma comment(lib, "dwmapi.lib")
 
+#ifndef STATUS_STACK_BUFFER_OVERRUN
+#define STATUS_STACK_BUFFER_OVERRUN ((LONG)0xC0000409L)
+#endif
+
 // ===========================
 // THREAD-SAFE GLOBAL STATE
 // ===========================
@@ -137,6 +141,19 @@ HHOOK g_hCallWndProcHook = NULL;
 // Subclassed Magnifier window HWND (protected by g_csGlobalState)
 // Using WindhawkUtils::SetWindowSubclassFromAnyThread for safe multi-mod subclassing
 HWND g_hSubclassedMagnifierWnd = NULL;
+
+// ===========================
+// CRASH PROTECTION STATE
+// ===========================
+
+// Flag indicating whether __report_gsfailure was successfully hooked
+volatile BOOL g_bGSFailureHooked = FALSE;
+
+// Address of __report_gsfailure (for diagnostic logging)
+volatile PVOID g_pReportGSFailure = NULL;
+
+// Counter of intercepted GS failures (for diagnostics)
+volatile LONG g_lGSFailureCount = 0;
 
 // Helper: Safe enter/leave critical section
 class AutoCriticalSection {
@@ -230,6 +247,208 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
     }
 
     return NULL;
+}
+
+// ===========================
+// CRASH PROTECTION (KB5074105)
+// ===========================
+
+// Locate __report_gsfailure in magnify.exe by scanning the PE image.
+//
+// Strategy:
+// 1. Parse PE headers to find IMAGE_LOAD_CONFIG_DIRECTORY
+// 2. Read SecurityCookie field (VA of __security_cookie global)
+// 3. Scan executable sections for __security_check_cookie pattern:
+//    48 3B 0D [disp32]  = CMP RCX, [rip+disp32] (compare with __security_cookie)
+//    75 [rel8] C3       = JNE rel8 + RET  (short form)
+//    --OR--
+//    0F 85 [rel32] C3   = JNE rel32 + RET (near form)
+// 4. The JNE target is __report_gsfailure
+static PVOID FindReportGSFailure() {
+    HMODULE hModule = GetModuleHandle(NULL);
+    if (!hModule) {
+        Wh_Log(L"Crash Protection: GetModuleHandle(NULL) failed");
+        return NULL;
+    }
+    BYTE* pBase = (BYTE*)hModule;
+
+    // Validate DOS header
+    IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)pBase;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        Wh_Log(L"Crash Protection: Invalid DOS signature");
+        return NULL;
+    }
+
+    // Validate NT headers (64-bit)
+    IMAGE_NT_HEADERS64* pNt = (IMAGE_NT_HEADERS64*)(pBase + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+        Wh_Log(L"Crash Protection: Invalid NT signature");
+        return NULL;
+    }
+    if (pNt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        Wh_Log(L"Crash Protection: Not a 64-bit PE (magic: 0x%X)",
+                pNt->OptionalHeader.Magic);
+        return NULL;
+    }
+
+    // Get Load Config Directory
+    if (pNt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) {
+        Wh_Log(L"Crash Protection: No Load Config directory entry");
+        return NULL;
+    }
+    IMAGE_DATA_DIRECTORY* pLoadConfigDir =
+        &pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (!pLoadConfigDir->VirtualAddress || !pLoadConfigDir->Size) {
+        Wh_Log(L"Crash Protection: Load Config directory is empty");
+        return NULL;
+    }
+
+    IMAGE_LOAD_CONFIG_DIRECTORY64* pLoadConfig =
+        (IMAGE_LOAD_CONFIG_DIRECTORY64*)(pBase + pLoadConfigDir->VirtualAddress);
+
+    // Get SecurityCookie VA
+    ULONGLONG securityCookieVA = pLoadConfig->SecurityCookie;
+    if (!securityCookieVA) {
+        Wh_Log(L"Crash Protection: SecurityCookie field is NULL");
+        return NULL;
+    }
+
+    Wh_Log(L"Crash Protection: __security_cookie at 0x%llX", securityCookieVA);
+
+    // Scan all executable sections for __security_check_cookie pattern
+    IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(pNt);
+    PVOID pFoundGSFailure = NULL;
+
+    for (WORD secIdx = 0; secIdx < pNt->FileHeader.NumberOfSections; secIdx++) {
+        if (!(pSections[secIdx].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+            continue;
+        }
+
+        BYTE* pSectionStart = pBase + pSections[secIdx].VirtualAddress;
+        DWORD sectionSize = pSections[secIdx].Misc.VirtualSize;
+
+        Wh_Log(L"Crash Protection: Scanning section '%.8S' (VA: 0x%X, Size: 0x%X)",
+                pSections[secIdx].Name,
+                pSections[secIdx].VirtualAddress,
+                sectionSize);
+
+        if (sectionSize < 10) continue;
+
+        for (DWORD offset = 0; offset < sectionSize - 16; offset++) {
+            BYTE* p = pSectionStart + offset;
+
+            // Match: 48 3B 0D xx xx xx xx (CMP RCX, [rip+disp32])
+            if (p[0] != 0x48 || p[1] != 0x3B || p[2] != 0x0D) {
+                continue;
+            }
+
+            // Compute RIP-relative target (RIP = p + 7, after this 7-byte instruction)
+            INT32 disp32 = *(INT32*)(p + 3);
+            BYTE* cmpTarget = p + 7 + disp32;
+
+            // Verify the CMP target is __security_cookie
+            if ((ULONGLONG)cmpTarget != securityCookieVA) {
+                continue;
+            }
+
+            BYTE* pAfterCmp = p + 7;
+            BYTE* pGSFailure = NULL;
+
+            // Pattern A: JNE rel8 (75 xx) followed by RET (C3)
+            if (pAfterCmp[0] == 0x75) {
+                if (pAfterCmp[2] != 0xC3) {
+                    continue;
+                }
+                INT8 rel8 = (INT8)pAfterCmp[1];
+                pGSFailure = pAfterCmp + 2 + rel8;
+            }
+            // Pattern B: JNE rel32 (0F 85 xx xx xx xx) followed by RET (C3)
+            else if (pAfterCmp[0] == 0x0F && pAfterCmp[1] == 0x85) {
+                if (pAfterCmp[6] != 0xC3) {
+                    continue;
+                }
+                INT32 rel32 = *(INT32*)(pAfterCmp + 2);
+                pGSFailure = pAfterCmp + 6 + rel32;
+            }
+            else {
+                continue;
+            }
+
+            // Validate target is within module bounds
+            BYTE* pModuleEnd = pBase + pNt->OptionalHeader.SizeOfImage;
+            if ((BYTE*)pGSFailure < pBase || (BYTE*)pGSFailure >= pModuleEnd) {
+                Wh_Log(L"Crash Protection: JNE target 0x%p outside module bounds", pGSFailure);
+                continue;
+            }
+
+            // Consistency check: multiple matches should agree
+            if (pFoundGSFailure && pFoundGSFailure != pGSFailure) {
+                Wh_Log(L"Crash Protection: WARNING - Multiple __report_gsfailure candidates: "
+                        L"0x%p and 0x%p", pFoundGSFailure, pGSFailure);
+                continue;
+            }
+
+            pFoundGSFailure = pGSFailure;
+            Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p, "
+                    L"__report_gsfailure at 0x%p", p, pGSFailure);
+        }
+    }
+
+    // Log diagnostic bytes at the found address
+    if (pFoundGSFailure) {
+        BYTE* b = (BYTE*)pFoundGSFailure;
+        Wh_Log(L"Crash Protection: First bytes at __report_gsfailure: "
+                L"%02X %02X %02X %02X %02X %02X %02X %02X "
+                L"%02X %02X %02X %02X %02X %02X %02X %02X",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    }
+
+    return pFoundGSFailure;
+}
+
+// --- __report_gsfailure Hook ---
+
+typedef void (__cdecl *ReportGSFailure_t)(uintptr_t);
+ReportGSFailure_t ReportGSFailure_Original = nullptr;
+
+// Intercepts __report_gsfailure: terminates only the faulting thread
+// instead of the entire process via __fastfail.
+// This function must NEVER return (stack is potentially corrupted).
+void __cdecl ReportGSFailure_Hook(uintptr_t stackCookie) {
+    LONG count = InterlockedIncrement(&g_lGSFailureCount);
+
+    Wh_Log(L"Crash Protection: INTERCEPTED __report_gsfailure! "
+            L"Cookie: 0x%llX, Thread: %lu, Count: %ld",
+            (ULONGLONG)stackCookie, GetCurrentThreadId(), count);
+
+    // Terminate ONLY the faulting thread, not the process.
+    // ExitThread transitions to kernel via syscall - safe even with corrupted stack.
+    ExitThread((DWORD)STATUS_STACK_BUFFER_OVERRUN);
+
+    // Safeguard: never reach original __fastfail
+    for (;;) { Sleep(INFINITE); }
+}
+
+// --- Error Suppression ---
+
+static void InstallErrorSuppression() {
+    // Suppress hard error dialogs from csrss.exe
+    UINT oldMode = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    SetErrorMode(oldMode | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    Wh_Log(L"Crash Protection: Error mode set (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)");
+
+    // Try WER flags to suppress WER UI
+    typedef HRESULT (WINAPI *WerSetFlags_t)(DWORD dwFlags);
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (hKernel32) {
+        WerSetFlags_t pWerSetFlags = (WerSetFlags_t)GetProcAddress(hKernel32, "WerSetFlags");
+        if (pWerSetFlags) {
+            // WER_FAULT_REPORTING_NO_UI = 0x0020
+            HRESULT hr = pWerSetFlags(0x0020);
+            Wh_Log(L"Crash Protection: WerSetFlags(NO_UI) returned 0x%08X", hr);
+        }
+    }
 }
 
 // Optimized inline function to check if a window is the Magnifier window
@@ -764,6 +983,37 @@ BOOL Wh_ModInit() {
     }
     g_bCriticalSectionInitialized = TRUE;
 
+    // =============================================
+    // CRASH PROTECTION (must be first, before any other hooks)
+    // Mitigates KB5074105 magnify.exe stack buffer overflow
+    // =============================================
+    Wh_Log(L"Crash Protection: Setting up crash protection...");
+
+    // Always install error suppression (suppress csrss hard error dialog)
+    InstallErrorSuppression();
+
+    // Try to find and hook __report_gsfailure in magnify.exe PE image
+    PVOID pGSFailure = FindReportGSFailure();
+    if (pGSFailure) {
+        g_pReportGSFailure = pGSFailure;
+        Wh_Log(L"Crash Protection: Found __report_gsfailure at 0x%p, installing hook...",
+                pGSFailure);
+
+        if (Wh_SetFunctionHook(pGSFailure,
+                                (void*)ReportGSFailure_Hook,
+                                (void**)&ReportGSFailure_Original)) {
+            g_bGSFailureHooked = TRUE;
+            Wh_Log(L"Crash Protection: __report_gsfailure hook installed successfully!");
+        } else {
+            Wh_Log(L"Crash Protection: WARNING - Failed to hook __report_gsfailure.");
+        }
+    } else {
+        Wh_Log(L"Crash Protection: WARNING - Could not find __report_gsfailure in PE image.");
+    }
+
+    Wh_Log(L"Crash Protection: Setup complete (GS hook: %s).",
+            g_bGSFailureHooked ? L"YES" : L"NO");
+
     // Set up all hooks BEFORE creating windows to prevent race conditions
     Wh_Log(L"Magnifier Headless: Setting up function hooks...");
 
@@ -883,6 +1133,15 @@ void Wh_ModUninit() {
 
     // Mark as uninitialized (atomic operation)
     InterlockedExchange(&g_lInitialized, 0);
+
+    // Log crash protection statistics
+    if (g_bGSFailureHooked || g_lGSFailureCount > 0) {
+        Wh_Log(L"Crash Protection: Uninitializing. Total GS failures intercepted: %ld",
+                g_lGSFailureCount);
+    }
+    g_bGSFailureHooked = FALSE;
+    g_pReportGSFailure = NULL;
+    // Note: Wh_SetFunctionHook hooks are automatically removed by Windhawk
 
     // Unhook window procedure hook
     if (g_hCallWndProcHook) {
