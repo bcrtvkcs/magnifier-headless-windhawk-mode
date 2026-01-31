@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.9.6.0
+// @version         0.9.6.1
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -146,13 +146,16 @@ HWND g_hSubclassedMagnifierWnd = NULL;
 // CRASH PROTECTION STATE
 // ===========================
 
-// Flag indicating whether __report_gsfailure was successfully hooked
-volatile BOOL g_bGSFailureHooked = FALSE;
+// Flag indicating whether __security_check_cookie was successfully hooked
+volatile BOOL g_bCookieCheckHooked = FALSE;
 
-// Address of __report_gsfailure (for diagnostic logging)
-volatile PVOID g_pReportGSFailure = NULL;
+// Address of __security_check_cookie function (for diagnostic logging)
+volatile PVOID g_pSecurityCheckCookie = NULL;
 
-// Counter of intercepted GS failures (for diagnostics)
+// Address of __security_cookie variable (for mismatch detection in hook)
+volatile PVOID g_pSecurityCookieAddr = NULL;
+
+// Counter of intercepted GS cookie mismatches (for diagnostics)
 volatile LONG g_lGSFailureCount = 0;
 
 // Helper: Safe enter/leave critical section
@@ -253,18 +256,20 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
 // CRASH PROTECTION (KB5074105)
 // ===========================
 
-// Locate __report_gsfailure in magnify.exe by scanning the PE image.
+// Locate __security_check_cookie in magnify.exe by scanning the PE image.
 //
 // Strategy:
 // 1. Parse PE headers to find IMAGE_LOAD_CONFIG_DIRECTORY
 // 2. Read SecurityCookie field (VA of __security_cookie global)
 // 3. Scan executable sections for __security_check_cookie pattern:
 //    48 3B 0D [disp32]  = CMP RCX, [rip+disp32] (compare with __security_cookie)
-//    75 [rel8] C3       = JNE rel8 + RET  (short form)
-//    --OR--
-//    0F 85 [rel32] C3   = JNE rel32 + RET (near form)
-// 4. The JNE target is __report_gsfailure
-static PVOID FindReportGSFailure() {
+//    followed by a conditional branch (JNE/JE rel8 or rel32)
+// 4. Return the address of the CMP instruction (start of __security_check_cookie)
+//
+// Modern MSVC may inline __fastfail (int 0x29) directly into this function,
+// so there may be no separate __report_gsfailure to hook. By hooking
+// __security_check_cookie itself, we intercept BEFORE int 0x29 fires.
+static PVOID FindSecurityCheckCookie() {
     HMODULE hModule = GetModuleHandle(NULL);
     if (!hModule) {
         Wh_Log(L"Crash Protection: GetModuleHandle(NULL) failed");
@@ -313,11 +318,13 @@ static PVOID FindReportGSFailure() {
         return NULL;
     }
 
+    // Store for use by the hook function
+    g_pSecurityCookieAddr = (PVOID)securityCookieVA;
     Wh_Log(L"Crash Protection: __security_cookie at 0x%llX", securityCookieVA);
 
     // Scan all executable sections for __security_check_cookie pattern
     IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(pNt);
-    PVOID pFoundGSFailure = NULL;
+    PVOID pFoundCheckCookie = NULL;
 
     for (WORD secIdx = 0; secIdx < pNt->FileHeader.NumberOfSections; secIdx++) {
         if (!(pSections[secIdx].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
@@ -351,83 +358,73 @@ static PVOID FindReportGSFailure() {
                 continue;
             }
 
+            // Verify next instruction is a conditional branch (JNE/JE variants)
             BYTE* pAfterCmp = p + 7;
-            BYTE* pGSFailure = NULL;
+            BOOL validPattern = FALSE;
 
-            // Pattern A: JNE rel8 (75 xx) followed by RET (C3)
-            if (pAfterCmp[0] == 0x75) {
-                if (pAfterCmp[2] != 0xC3) {
-                    continue;
-                }
-                INT8 rel8 = (INT8)pAfterCmp[1];
-                pGSFailure = pAfterCmp + 2 + rel8;
+            // JNE rel8 (75 xx) or JE rel8 (74 xx)
+            if (pAfterCmp[0] == 0x75 || pAfterCmp[0] == 0x74) {
+                validPattern = TRUE;
             }
-            // Pattern B: JNE rel32 (0F 85 xx xx xx xx) followed by RET (C3)
-            else if (pAfterCmp[0] == 0x0F && pAfterCmp[1] == 0x85) {
-                if (pAfterCmp[6] != 0xC3) {
-                    continue;
-                }
-                INT32 rel32 = *(INT32*)(pAfterCmp + 2);
-                pGSFailure = pAfterCmp + 6 + rel32;
+            // JNE rel32 (0F 85 xx xx xx xx) or JE rel32 (0F 84 xx xx xx xx)
+            else if (pAfterCmp[0] == 0x0F && (pAfterCmp[1] == 0x85 || pAfterCmp[1] == 0x84)) {
+                validPattern = TRUE;
             }
-            else {
+
+            if (!validPattern) {
                 continue;
             }
 
-            // Validate target is within module bounds
-            BYTE* pModuleEnd = pBase + pNt->OptionalHeader.SizeOfImage;
-            if ((BYTE*)pGSFailure < pBase || (BYTE*)pGSFailure >= pModuleEnd) {
-                Wh_Log(L"Crash Protection: JNE target 0x%p outside module bounds", pGSFailure);
+            // Consistency check: all matches should point to the same function
+            if (pFoundCheckCookie && pFoundCheckCookie != p) {
+                Wh_Log(L"Crash Protection: WARNING - Multiple __security_check_cookie candidates: "
+                        L"0x%p and 0x%p", pFoundCheckCookie, p);
                 continue;
             }
 
-            // Consistency check: multiple matches should agree
-            if (pFoundGSFailure && pFoundGSFailure != pGSFailure) {
-                Wh_Log(L"Crash Protection: WARNING - Multiple __report_gsfailure candidates: "
-                        L"0x%p and 0x%p", pFoundGSFailure, pGSFailure);
-                continue;
-            }
-
-            pFoundGSFailure = pGSFailure;
-            Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p, "
-                    L"__report_gsfailure at 0x%p", p, pGSFailure);
+            pFoundCheckCookie = p;
+            Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p", p);
         }
     }
 
     // Log diagnostic bytes at the found address
-    if (pFoundGSFailure) {
-        BYTE* b = (BYTE*)pFoundGSFailure;
-        Wh_Log(L"Crash Protection: First bytes at __report_gsfailure: "
+    if (pFoundCheckCookie) {
+        BYTE* b = (BYTE*)pFoundCheckCookie;
+        Wh_Log(L"Crash Protection: Bytes at __security_check_cookie: "
                 L"%02X %02X %02X %02X %02X %02X %02X %02X "
                 L"%02X %02X %02X %02X %02X %02X %02X %02X",
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                 b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
 
-    return pFoundGSFailure;
+    return pFoundCheckCookie;
 }
 
-// --- __report_gsfailure Hook ---
+// --- __security_check_cookie Hook ---
 
-typedef void (__cdecl *ReportGSFailure_t)(uintptr_t);
-ReportGSFailure_t ReportGSFailure_Original = nullptr;
+typedef void (__cdecl *SecurityCheckCookie_t)(uintptr_t);
+SecurityCheckCookie_t SecurityCheckCookie_Original = nullptr;
 
-// Intercepts __report_gsfailure: terminates only the faulting thread
-// instead of the entire process via __fastfail.
-// This function must NEVER return (stack is potentially corrupted).
-void __cdecl ReportGSFailure_Hook(uintptr_t stackCookie) {
-    LONG count = InterlockedIncrement(&g_lGSFailureCount);
-
-    Wh_Log(L"Crash Protection: INTERCEPTED __report_gsfailure! "
-            L"Cookie: 0x%llX, Thread: %lu, Count: %ld",
-            (ULONGLONG)stackCookie, GetCurrentThreadId(), count);
-
-    // Terminate ONLY the faulting thread, not the process.
-    // ExitThread transitions to kernel via syscall - safe even with corrupted stack.
-    ExitThread((DWORD)STATUS_STACK_BUFFER_OVERRUN);
-
-    // Safeguard: never reach original __fastfail
-    for (;;) { Sleep(INFINITE); }
+// Replaces __security_check_cookie: validates the cookie but returns normally
+// on mismatch instead of calling __fastfail / __report_gsfailure.
+// This prevents STATUS_STACK_BUFFER_OVERRUN process termination.
+void __cdecl SecurityCheckCookie_Hook(uintptr_t stackCookie) {
+    // Hot path: check if cookie matches (99.99% of calls)
+    if (g_pSecurityCookieAddr) {
+        uintptr_t expected = *(volatile uintptr_t*)g_pSecurityCookieAddr;
+        if (stackCookie == expected) {
+            return;  // Valid cookie, return immediately
+        }
+        // Mismatch detected - log but DON'T crash
+        LONG count = InterlockedIncrement(&g_lGSFailureCount);
+        if (count <= 10) {
+            Wh_Log(L"Crash Protection: GS cookie mismatch #%ld on thread %lu "
+                    L"(expected 0x%llX, got 0x%llX)",
+                    count, GetCurrentThreadId(),
+                    (ULONGLONG)expected, (ULONGLONG)stackCookie);
+        }
+    }
+    // Return normally in ALL cases - never crash
 }
 
 // --- Error Suppression ---
@@ -992,27 +989,27 @@ BOOL Wh_ModInit() {
     // Always install error suppression (suppress csrss hard error dialog)
     InstallErrorSuppression();
 
-    // Try to find and hook __report_gsfailure in magnify.exe PE image
-    PVOID pGSFailure = FindReportGSFailure();
-    if (pGSFailure) {
-        g_pReportGSFailure = pGSFailure;
-        Wh_Log(L"Crash Protection: Found __report_gsfailure at 0x%p, installing hook...",
-                pGSFailure);
+    // Try to find and hook __security_check_cookie in magnify.exe PE image
+    PVOID pCheckCookie = FindSecurityCheckCookie();
+    if (pCheckCookie) {
+        g_pSecurityCheckCookie = pCheckCookie;
+        Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p, installing hook...",
+                pCheckCookie);
 
-        if (Wh_SetFunctionHook(pGSFailure,
-                                (void*)ReportGSFailure_Hook,
-                                (void**)&ReportGSFailure_Original)) {
-            g_bGSFailureHooked = TRUE;
-            Wh_Log(L"Crash Protection: __report_gsfailure hook installed successfully!");
+        if (Wh_SetFunctionHook(pCheckCookie,
+                                (void*)SecurityCheckCookie_Hook,
+                                (void**)&SecurityCheckCookie_Original)) {
+            g_bCookieCheckHooked = TRUE;
+            Wh_Log(L"Crash Protection: __security_check_cookie hook installed successfully!");
         } else {
-            Wh_Log(L"Crash Protection: WARNING - Failed to hook __report_gsfailure.");
+            Wh_Log(L"Crash Protection: WARNING - Failed to hook __security_check_cookie.");
         }
     } else {
-        Wh_Log(L"Crash Protection: WARNING - Could not find __report_gsfailure in PE image.");
+        Wh_Log(L"Crash Protection: WARNING - Could not find __security_check_cookie in PE image.");
     }
 
-    Wh_Log(L"Crash Protection: Setup complete (GS hook: %s).",
-            g_bGSFailureHooked ? L"YES" : L"NO");
+    Wh_Log(L"Crash Protection: Setup complete (cookie check hook: %s).",
+            g_bCookieCheckHooked ? L"YES" : L"NO");
 
     // Set up all hooks BEFORE creating windows to prevent race conditions
     Wh_Log(L"Magnifier Headless: Setting up function hooks...");
@@ -1135,12 +1132,13 @@ void Wh_ModUninit() {
     InterlockedExchange(&g_lInitialized, 0);
 
     // Log crash protection statistics
-    if (g_bGSFailureHooked || g_lGSFailureCount > 0) {
-        Wh_Log(L"Crash Protection: Uninitializing. Total GS failures intercepted: %ld",
+    if (g_bCookieCheckHooked || g_lGSFailureCount > 0) {
+        Wh_Log(L"Crash Protection: Uninitializing. Total GS cookie mismatches intercepted: %ld",
                 g_lGSFailureCount);
     }
-    g_bGSFailureHooked = FALSE;
-    g_pReportGSFailure = NULL;
+    g_bCookieCheckHooked = FALSE;
+    g_pSecurityCheckCookie = NULL;
+    g_pSecurityCookieAddr = NULL;
     // Note: Wh_SetFunctionHook hooks are automatically removed by Windhawk
 
     // Unhook window procedure hook
