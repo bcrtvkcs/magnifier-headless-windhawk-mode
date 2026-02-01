@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.9.6.2
+// @version         0.9.6.3
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -146,17 +146,27 @@ HWND g_hSubclassedMagnifierWnd = NULL;
 // CRASH PROTECTION STATE
 // ===========================
 
-// Flag indicating whether __security_check_cookie was successfully patched
+// Flag indicating whether any __security_check_cookie was successfully patched
 volatile BOOL g_bCookieCheckPatched = FALSE;
 
-// Address of __security_cookie variable (for diagnostics)
-volatile PVOID g_pSecurityCookieAddr = NULL;
-
-// Saved original bytes for restoration on mod unload
+// Multi-module patch tracking
+#define MAX_PATCHED_MODULES 64
 #define MAX_COOKIE_PATCH_SIZE 16
-BYTE g_originalCookieBytes[MAX_COOKIE_PATCH_SIZE] = {0};
-DWORD g_cookiePatchSize = 0;
-BYTE* g_pCookiePatchAddr = NULL;
+
+struct CookiePatchRecord {
+    HMODULE hModule;
+    BYTE* pPatchAddr;
+    BYTE originalBytes[MAX_COOKIE_PATCH_SIZE];
+    DWORD patchSize;
+    WCHAR moduleName[MAX_PATH];
+};
+
+CookiePatchRecord g_patchRecords[MAX_PATCHED_MODULES] = {0};
+int g_numPatches = 0;
+
+// Dialog monitor thread (Layer 2 fallback)
+HANDLE g_hDialogMonitorThread = NULL;
+volatile BOOL g_bMonitorRunning = FALSE;
 
 // Helper: Safe enter/leave critical section
 class AutoCriticalSection {
@@ -256,7 +266,7 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
 // CRASH PROTECTION (KB5074105)
 // ===========================
 
-// Locate __security_check_cookie in magnify.exe by scanning the PE image.
+// Locate __security_check_cookie in a given PE module by scanning its image.
 //
 // Strategy:
 // 1. Parse PE headers to find IMAGE_LOAD_CONFIG_DIRECTORY
@@ -266,14 +276,10 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
 //    followed by a conditional branch (JNE/JE rel8 or rel32)
 // 4. Return the address of the CMP instruction (start of __security_check_cookie)
 //
-// Modern MSVC may inline __fastfail (int 0x29) directly into this function,
-// so there may be no separate __report_gsfailure to hook. By patching
-// __security_check_cookie directly (NOP out the branch + int 0x29), we
-// prevent __fastfail from ever firing.
-static PVOID FindSecurityCheckCookie() {
-    HMODULE hModule = GetModuleHandle(NULL);
+// Each DLL has its own __security_cookie and __security_check_cookie.
+// KB5074105 crash may be in any loaded module, so we scan all of them.
+static PVOID FindSecurityCheckCookieInModule(HMODULE hModule) {
     if (!hModule) {
-        Wh_Log(L"Crash Protection: GetModuleHandle(NULL) failed");
         return NULL;
     }
     BYTE* pBase = (BYTE*)hModule;
@@ -281,31 +287,25 @@ static PVOID FindSecurityCheckCookie() {
     // Validate DOS header
     IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)pBase;
     if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
-        Wh_Log(L"Crash Protection: Invalid DOS signature");
         return NULL;
     }
 
     // Validate NT headers (64-bit)
     IMAGE_NT_HEADERS64* pNt = (IMAGE_NT_HEADERS64*)(pBase + pDos->e_lfanew);
     if (pNt->Signature != IMAGE_NT_SIGNATURE) {
-        Wh_Log(L"Crash Protection: Invalid NT signature");
         return NULL;
     }
     if (pNt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        Wh_Log(L"Crash Protection: Not a 64-bit PE (magic: 0x%X)",
-                pNt->OptionalHeader.Magic);
         return NULL;
     }
 
     // Get Load Config Directory
     if (pNt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) {
-        Wh_Log(L"Crash Protection: No Load Config directory entry");
         return NULL;
     }
     IMAGE_DATA_DIRECTORY* pLoadConfigDir =
         &pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
     if (!pLoadConfigDir->VirtualAddress || !pLoadConfigDir->Size) {
-        Wh_Log(L"Crash Protection: Load Config directory is empty");
         return NULL;
     }
 
@@ -315,13 +315,8 @@ static PVOID FindSecurityCheckCookie() {
     // Get SecurityCookie VA
     ULONGLONG securityCookieVA = pLoadConfig->SecurityCookie;
     if (!securityCookieVA) {
-        Wh_Log(L"Crash Protection: SecurityCookie field is NULL");
         return NULL;
     }
-
-    // Store for diagnostics
-    g_pSecurityCookieAddr = (PVOID)securityCookieVA;
-    Wh_Log(L"Crash Protection: __security_cookie at 0x%llX", securityCookieVA);
 
     // Scan all executable sections for __security_check_cookie pattern
     IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(pNt);
@@ -334,11 +329,6 @@ static PVOID FindSecurityCheckCookie() {
 
         BYTE* pSectionStart = pBase + pSections[secIdx].VirtualAddress;
         DWORD sectionSize = pSections[secIdx].Misc.VirtualSize;
-
-        Wh_Log(L"Crash Protection: Scanning section '%.8S' (VA: 0x%X, Size: 0x%X)",
-                pSections[secIdx].Name,
-                pSections[secIdx].VirtualAddress,
-                sectionSize);
 
         if (sectionSize < 10) continue;
 
@@ -376,26 +366,13 @@ static PVOID FindSecurityCheckCookie() {
                 continue;
             }
 
-            // Consistency check: all matches should point to the same function
+            // First match wins for this module
             if (pFoundCheckCookie && pFoundCheckCookie != p) {
-                Wh_Log(L"Crash Protection: WARNING - Multiple __security_check_cookie candidates: "
-                        L"0x%p and 0x%p", pFoundCheckCookie, p);
                 continue;
             }
 
             pFoundCheckCookie = p;
-            Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p", p);
         }
-    }
-
-    // Log diagnostic bytes at the found address
-    if (pFoundCheckCookie) {
-        BYTE* b = (BYTE*)pFoundCheckCookie;
-        Wh_Log(L"Crash Protection: Bytes at __security_check_cookie: "
-                L"%02X %02X %02X %02X %02X %02X %02X %02X "
-                L"%02X %02X %02X %02X %02X %02X %02X %02X",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     }
 
     return pFoundCheckCookie;
@@ -405,14 +382,20 @@ static PVOID FindSecurityCheckCookie() {
 // NOP out the conditional branch and __fastfail inside __security_check_cookie.
 // After patch: CMP (harmless) -> NOP... -> RET (always returns normally).
 // No MinHook/trampoline involved - just direct byte modification.
+// Stores patch record in g_patchRecords for restoration on unload.
 
-static BOOL PatchSecurityCheckCookie(BYTE* pFunc) {
+static BOOL PatchSecurityCheckCookie(BYTE* pFunc, HMODULE hModule, const WCHAR* moduleName) {
+    if (g_numPatches >= MAX_PATCHED_MODULES) {
+        Wh_Log(L"Crash Protection: Patch record array full (%d/%d)", g_numPatches, MAX_PATCHED_MODULES);
+        return FALSE;
+    }
+
     BYTE* pAfterCmp = pFunc + 7;  // Skip the 7-byte CMP instruction
 
     // Scan forward (up to 16 bytes) to find RET (C3) or REP RET (F3 C3)
     BYTE* pRet = NULL;
     for (int i = 0; i < MAX_COOKIE_PATCH_SIZE; i++) {
-        if (pAfterCmp[i] == 0xF3 && (i + 1) < MAX_COOKIE_PATCH_SIZE && pAfterCmp[i + 1] == 0xC3) {
+        if (i + 1 < MAX_COOKIE_PATCH_SIZE && pAfterCmp[i] == 0xF3 && pAfterCmp[i + 1] == 0xC3) {
             pRet = &pAfterCmp[i];  // REP RET
             break;
         }
@@ -423,53 +406,61 @@ static BOOL PatchSecurityCheckCookie(BYTE* pFunc) {
     }
 
     if (!pRet) {
-        Wh_Log(L"Crash Protection: Could not find RET in __security_check_cookie");
+        Wh_Log(L"Crash Protection: Could not find RET in __security_check_cookie for %ls", moduleName);
         return FALSE;
     }
 
     // Calculate how many bytes to NOP (from after CMP to before RET)
-    DWORD patchSize = (DWORD)(pRet - pAfterCmp);
-    if (patchSize == 0 || patchSize > MAX_COOKIE_PATCH_SIZE) {
-        Wh_Log(L"Crash Protection: Invalid patch size: %lu", patchSize);
+    DWORD nopSize = (DWORD)(pRet - pAfterCmp);
+    if (nopSize == 0 || nopSize > MAX_COOKIE_PATCH_SIZE) {
+        Wh_Log(L"Crash Protection: Invalid patch size: %lu for %ls", nopSize, moduleName);
         return FALSE;
     }
 
     // Also check for INT 29h (CD 29) after the RET and NOP those too
-    DWORD totalPatchSize = patchSize;
+    DWORD totalPatchSize = nopSize;
     BYTE* pAfterRet = pRet + 1;
     if (pAfterRet[0] == 0xF3 && pAfterRet[1] == 0xC3) {
         pAfterRet = pRet + 2;  // Skip REP RET
     }
     if (pAfterRet[0] == 0xCD && pAfterRet[1] == 0x29) {
-        // INT 29h found after RET - include it in patch
         totalPatchSize = (DWORD)(pAfterRet + 2 - pAfterCmp);
     }
 
-    Wh_Log(L"Crash Protection: Patching %lu bytes at 0x%p (RET at offset +%lu)",
-            totalPatchSize, pAfterCmp, patchSize);
+    if (totalPatchSize > MAX_COOKIE_PATCH_SIZE) {
+        Wh_Log(L"Crash Protection: Total patch size too large: %lu for %ls", totalPatchSize, moduleName);
+        return FALSE;
+    }
 
-    // Save original bytes for restoration
-    memcpy(g_originalCookieBytes, pAfterCmp, totalPatchSize);
-    g_cookiePatchSize = totalPatchSize;
-    g_pCookiePatchAddr = pAfterCmp;
+    // Save original bytes to patch record
+    CookiePatchRecord* rec = &g_patchRecords[g_numPatches];
+    rec->hModule = hModule;
+    rec->pPatchAddr = pAfterCmp;
+    rec->patchSize = totalPatchSize;
+    memcpy(rec->originalBytes, pAfterCmp, totalPatchSize);
+    wcsncpy(rec->moduleName, moduleName, MAX_PATH - 1);
+    rec->moduleName[MAX_PATH - 1] = L'\0';
 
     // Make memory writable
     DWORD oldProtect;
     if (!VirtualProtect(pAfterCmp, totalPatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        Wh_Log(L"Crash Protection: VirtualProtect failed (error: %lu)", GetLastError());
+        Wh_Log(L"Crash Protection: VirtualProtect failed for %ls (error: %lu)", moduleName, GetLastError());
         return FALSE;
     }
 
     // NOP everything from after CMP to before RET
-    for (DWORD i = 0; i < patchSize; i++) {
+    for (DWORD i = 0; i < nopSize; i++) {
         pAfterCmp[i] = 0x90;  // NOP
     }
 
     // NOP any INT 29h after the RET (dead code cleanup)
-    for (DWORD i = patchSize + 1; i < totalPatchSize; i++) {
-        // Skip the RET byte itself
-        if (pAfterCmp[i] == 0xC3 || (pAfterCmp[i] == 0xF3 && pAfterCmp[i + 1] == 0xC3)) {
-            continue;
+    // Skip the RET byte(s), NOP everything else
+    for (DWORD i = nopSize + 1; i < totalPatchSize; i++) {
+        if (pAfterCmp[i] == 0xC3) {
+            continue;  // Skip RET
+        }
+        if (i + 1 < totalPatchSize && pAfterCmp[i] == 0xF3 && pAfterCmp[i + 1] == 0xC3) {
+            continue;  // Skip REP prefix of REP RET
         }
         pAfterCmp[i] = 0x90;  // NOP
     }
@@ -480,34 +471,155 @@ static BOOL PatchSecurityCheckCookie(BYTE* pFunc) {
     // Flush instruction cache
     FlushInstructionCache(GetCurrentProcess(), pAfterCmp, totalPatchSize);
 
-    // Log the patched bytes
-    Wh_Log(L"Crash Protection: Patched bytes: "
-            L"%02X %02X %02X %02X %02X %02X %02X %02X "
-            L"%02X %02X %02X %02X %02X %02X %02X %02X",
-            pAfterCmp[0], pAfterCmp[1], pAfterCmp[2], pAfterCmp[3],
-            pAfterCmp[4], pAfterCmp[5], pAfterCmp[6], pAfterCmp[7],
-            pAfterCmp[8], pAfterCmp[9], pAfterCmp[10], pAfterCmp[11],
-            pAfterCmp[12], pAfterCmp[13], pAfterCmp[14], pAfterCmp[15]);
+    g_numPatches++;
 
+    Wh_Log(L"Crash Protection: Patched %lu bytes in %ls at 0x%p", totalPatchSize, moduleName, pAfterCmp);
     return TRUE;
 }
 
-static void RestoreSecurityCheckCookie() {
-    if (!g_pCookiePatchAddr || g_cookiePatchSize == 0) {
+// --- Patch ALL Loaded Modules ---
+// Enumerates all loaded modules (exe + DLLs) and patches each one's __security_check_cookie.
+// Uses PSAPI EnumProcessModules via dynamic import (no extra lib needed).
+
+static void PatchAllModules() {
+    typedef BOOL (WINAPI *EnumProcessModules_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    typedef DWORD (WINAPI *GetModuleFileNameExW_t)(HANDLE, HMODULE, LPWSTR, DWORD);
+
+    HMODULE hPsapi = LoadLibraryW(L"psapi.dll");
+    if (!hPsapi) {
+        // Fallback: try kernel32 (EnumProcessModules moved there in Win7+)
+        hPsapi = GetModuleHandleW(L"kernel32.dll");
+    }
+    if (!hPsapi) {
+        Wh_Log(L"Crash Protection: Cannot load psapi.dll or kernel32.dll for module enumeration");
         return;
     }
 
-    DWORD oldProtect;
-    if (VirtualProtect(g_pCookiePatchAddr, g_cookiePatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy(g_pCookiePatchAddr, g_originalCookieBytes, g_cookiePatchSize);
-        VirtualProtect(g_pCookiePatchAddr, g_cookiePatchSize, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), g_pCookiePatchAddr, g_cookiePatchSize);
-        Wh_Log(L"Crash Protection: Restored original __security_check_cookie bytes (%lu bytes)",
-                g_cookiePatchSize);
+    EnumProcessModules_t pEnumProcessModules =
+        (EnumProcessModules_t)GetProcAddress(hPsapi, "EnumProcessModules");
+    GetModuleFileNameExW_t pGetModuleFileNameExW =
+        (GetModuleFileNameExW_t)GetProcAddress(hPsapi, "GetModuleFileNameExW");
+
+    // Also try K32 variants (Windows 7+ exports these from kernel32)
+    if (!pEnumProcessModules) {
+        pEnumProcessModules = (EnumProcessModules_t)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules");
+    }
+    if (!pGetModuleFileNameExW) {
+        pGetModuleFileNameExW = (GetModuleFileNameExW_t)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "K32GetModuleFileNameExW");
     }
 
-    g_pCookiePatchAddr = NULL;
-    g_cookiePatchSize = 0;
+    if (!pEnumProcessModules) {
+        Wh_Log(L"Crash Protection: EnumProcessModules not found");
+        return;
+    }
+
+    HANDLE hProcess = GetCurrentProcess();
+    HMODULE hModules[512];
+    DWORD cbNeeded = 0;
+
+    if (!pEnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded)) {
+        Wh_Log(L"Crash Protection: EnumProcessModules failed (error: %lu)", GetLastError());
+        return;
+    }
+
+    DWORD numModules = cbNeeded / sizeof(HMODULE);
+    int patchedCount = 0;
+
+    Wh_Log(L"Crash Protection: Scanning %lu loaded modules...", numModules);
+
+    for (DWORD i = 0; i < numModules && g_numPatches < MAX_PATCHED_MODULES; i++) {
+        WCHAR moduleName[MAX_PATH] = {0};
+        if (pGetModuleFileNameExW) {
+            pGetModuleFileNameExW(hProcess, hModules[i], moduleName, MAX_PATH);
+        } else {
+            GetModuleFileNameW(hModules[i], moduleName, MAX_PATH);
+        }
+
+        // Extract just the filename for logging
+        WCHAR* pFileName = wcsrchr(moduleName, L'\\');
+        if (pFileName) pFileName++; else pFileName = moduleName;
+
+        PVOID pCheckCookie = FindSecurityCheckCookieInModule(hModules[i]);
+        if (pCheckCookie) {
+            if (PatchSecurityCheckCookie((BYTE*)pCheckCookie, hModules[i], pFileName)) {
+                patchedCount++;
+                Wh_Log(L"Crash Protection: [%d/%lu] PATCHED: %ls", i + 1, numModules, pFileName);
+            } else {
+                Wh_Log(L"Crash Protection: [%d/%lu] PATCH FAILED: %ls", i + 1, numModules, pFileName);
+            }
+        }
+    }
+
+    Wh_Log(L"Crash Protection: Patched %d modules out of %lu total (records: %d)",
+            patchedCount, numModules, g_numPatches);
+}
+
+// --- Restore ALL Patches ---
+
+static void RestoreAllPatches() {
+    for (int i = 0; i < g_numPatches; i++) {
+        CookiePatchRecord* rec = &g_patchRecords[i];
+        if (!rec->pPatchAddr || rec->patchSize == 0) continue;
+
+        DWORD oldProtect;
+        if (VirtualProtect(rec->pPatchAddr, rec->patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(rec->pPatchAddr, rec->originalBytes, rec->patchSize);
+            VirtualProtect(rec->pPatchAddr, rec->patchSize, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), rec->pPatchAddr, rec->patchSize);
+            Wh_Log(L"Crash Protection: Restored %ls (%lu bytes)", rec->moduleName, rec->patchSize);
+        }
+    }
+
+    Wh_Log(L"Crash Protection: Restored %d module patches", g_numPatches);
+    g_numPatches = 0;
+}
+
+// --- Dialog Monitor Thread (Layer 2 Fallback) ---
+// Monitors for csrss.exe hard error dialogs and hides them.
+// HIDE (not dismiss) keeps kernel waiting, so the process stays alive.
+
+struct DialogSearchContext {
+    int hiddenCount;
+};
+
+static BOOL CALLBACK HardErrorDialogEnumProc(HWND hwnd, LPARAM lParam) {
+    DialogSearchContext* ctx = (DialogSearchContext*)lParam;
+
+    // Check if this is a standard dialog window (#32770)
+    WCHAR className[32] = {0};
+    if (!GetClassNameW(hwnd, className, 32)) return TRUE;
+    if (wcscmp(className, L"#32770") != 0) return TRUE;
+
+    // Check if the title contains "Magnify.exe" or "magnify.exe"
+    WCHAR title[256] = {0};
+    if (!GetWindowTextW(hwnd, title, 256)) return TRUE;
+
+    if (wcsstr(title, L"Magnify.exe") || wcsstr(title, L"magnify.exe") ||
+        wcsstr(title, L"MAGNIFY.EXE") || wcsstr(title, L"Magnify.EXE")) {
+        // Found the hard error dialog - hide it (don't dismiss!)
+        if (IsWindowVisible(hwnd)) {
+            ShowWindow(hwnd, SW_HIDE);
+            ctx->hiddenCount++;
+            Wh_Log(L"Crash Protection: Auto-hid hard error dialog (HWND: 0x%p, title: %ls)", hwnd, title);
+        }
+    }
+
+    return TRUE;  // Continue enumeration
+}
+
+static DWORD WINAPI DialogMonitorThreadProc(LPVOID lpParam) {
+    Wh_Log(L"Crash Protection: Dialog monitor thread started");
+
+    while (g_bMonitorRunning) {
+        DialogSearchContext ctx = {0};
+        EnumWindows(HardErrorDialogEnumProc, (LPARAM)&ctx);
+        Sleep(50);  // 50ms polling interval
+    }
+
+    Wh_Log(L"Crash Protection: Dialog monitor thread stopped");
+    return 0;
 }
 
 // --- Error Suppression ---
@@ -1066,30 +1178,35 @@ BOOL Wh_ModInit() {
     // =============================================
     // CRASH PROTECTION (must be first, before any other hooks)
     // Mitigates KB5074105 magnify.exe stack buffer overflow
+    // Two-layer defense:
+    //   Layer 1: Patch __security_check_cookie in ALL loaded modules
+    //   Layer 2: Dialog monitor thread auto-hides hard error dialogs
     // =============================================
-    Wh_Log(L"Crash Protection: Setting up crash protection...");
+    Wh_Log(L"Crash Protection: Setting up two-layer crash protection...");
 
-    // Always install error suppression (suppress csrss hard error dialog)
+    // Install error suppression (minor safety net, won't catch __fastfail)
     InstallErrorSuppression();
 
-    // Try to find and patch __security_check_cookie in magnify.exe PE image
-    PVOID pCheckCookie = FindSecurityCheckCookie();
-    if (pCheckCookie) {
-        Wh_Log(L"Crash Protection: Found __security_check_cookie at 0x%p, applying patch...",
-                pCheckCookie);
-
-        if (PatchSecurityCheckCookie((BYTE*)pCheckCookie)) {
-            g_bCookieCheckPatched = TRUE;
-            Wh_Log(L"Crash Protection: __security_check_cookie patched successfully!");
-        } else {
-            Wh_Log(L"Crash Protection: WARNING - Failed to patch __security_check_cookie.");
-        }
-    } else {
-        Wh_Log(L"Crash Protection: WARNING - Could not find __security_check_cookie in PE image.");
+    // Layer 1: Scan and patch ALL loaded modules (exe + DLLs)
+    PatchAllModules();
+    if (g_numPatches > 0) {
+        g_bCookieCheckPatched = TRUE;
     }
 
-    Wh_Log(L"Crash Protection: Setup complete (cookie check patched: %s).",
-            g_bCookieCheckPatched ? L"YES" : L"NO");
+    // Layer 2: Start dialog monitor thread (bulletproof fallback)
+    // Even if all __security_check_cookie patches succeed, inlined __fastfail
+    // or late-loaded DLLs could still trigger the dialog.
+    g_bMonitorRunning = TRUE;
+    g_hDialogMonitorThread = CreateThread(NULL, 0, DialogMonitorThreadProc, NULL, 0, NULL);
+    if (g_hDialogMonitorThread) {
+        Wh_Log(L"Crash Protection: Dialog monitor thread started");
+    } else {
+        Wh_Log(L"Crash Protection: WARNING - Failed to start dialog monitor thread (error: %lu)",
+                GetLastError());
+    }
+
+    Wh_Log(L"Crash Protection: Setup complete (modules patched: %d, monitor: %s).",
+            g_numPatches, g_hDialogMonitorThread ? L"ACTIVE" : L"FAILED");
 
     // Set up all hooks BEFORE creating windows to prevent race conditions
     Wh_Log(L"Magnifier Headless: Setting up function hooks...");
@@ -1211,12 +1328,20 @@ void Wh_ModUninit() {
     // Mark as uninitialized (atomic operation)
     InterlockedExchange(&g_lInitialized, 0);
 
-    // Restore original __security_check_cookie bytes
+    // Stop dialog monitor thread first
+    if (g_hDialogMonitorThread) {
+        g_bMonitorRunning = FALSE;
+        WaitForSingleObject(g_hDialogMonitorThread, 2000);  // Wait up to 2 seconds
+        CloseHandle(g_hDialogMonitorThread);
+        g_hDialogMonitorThread = NULL;
+        Wh_Log(L"Magnifier Headless: Dialog monitor thread stopped.");
+    }
+
+    // Restore ALL patched __security_check_cookie functions
     if (g_bCookieCheckPatched) {
-        RestoreSecurityCheckCookie();
+        RestoreAllPatches();
         g_bCookieCheckPatched = FALSE;
     }
-    g_pSecurityCookieAddr = NULL;
 
     // Unhook window procedure hook
     if (g_hCallWndProcHook) {
