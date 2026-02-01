@@ -139,6 +139,15 @@ HHOOK g_hCallWndProcHook = NULL;
 // Using WindhawkUtils::SetWindowSubclassFromAnyThread for safe multi-mod subclassing
 HWND g_hSubclassedMagnifierWnd = NULL;
 
+// ===========================
+// CRASH PROTECTION STATE (KB5074105)
+// ===========================
+// WM_SIZE suppression in the subclassed WndProc prevents the crash at its source,
+// but the dialog monitor serves as a safety net for crashes that occur before
+// subclassing takes effect or through other code paths.
+HANDLE g_hDialogMonitorThread = NULL;
+HANDLE g_hMonitorStopEvent = NULL;
+
 // Helper: Safe enter/leave critical section
 class AutoCriticalSection {
 private:
@@ -231,6 +240,48 @@ inline HWND SafeSetParent(HWND hWndChild, HWND hWndNewParent) {
     }
 
     return NULL;
+}
+
+// ===========================
+// CRASH PROTECTION (KB5074105)
+// ===========================
+// KB5074105 causes a stack buffer overflow in magnify.exe.
+// WM_SIZE suppression in the subclassed WndProc is the primary fix.
+// This dialog monitor is a safety net: it auto-hides the hard error dialog
+// from csrss.exe if the crash still occurs (e.g. before subclassing is active).
+
+static BOOL CALLBACK HardErrorDialogEnumProc(HWND hwnd, LPARAM lParam) {
+    if (!IsWindow(hwnd)) return TRUE;
+
+    // Check if this is a standard dialog window (#32770)
+    WCHAR className[32] = {0};
+    if (!GetClassNameW(hwnd, className, 32)) return TRUE;
+    if (wcscmp(className, L"#32770") != 0) return TRUE;
+
+    // Check if the title contains "magnify.exe" (case-insensitive)
+    WCHAR title[256] = {0};
+    if (!GetWindowTextW(hwnd, title, 256)) return TRUE;
+
+    _wcslwr(title);
+    if (wcsstr(title, L"magnify.exe")) {
+        if (IsWindowVisible(hwnd)) {
+            ShowWindow(hwnd, SW_HIDE);
+            Wh_Log(L"Crash Protection: Auto-hid hard error dialog (HWND: 0x%p)", hwnd);
+        }
+    }
+
+    return TRUE;
+}
+
+static DWORD WINAPI DialogMonitorThreadProc(LPVOID lpParam) {
+    Wh_Log(L"Crash Protection: Dialog monitor thread started");
+
+    while (WaitForSingleObject(g_hMonitorStopEvent, 100) == WAIT_TIMEOUT) {
+        EnumWindows(HardErrorDialogEnumProc, 0);
+    }
+
+    Wh_Log(L"Crash Protection: Dialog monitor thread stopped");
+    return 0;
 }
 
 // Optimized inline function to check if a window is the Magnifier window
@@ -766,6 +817,25 @@ BOOL Wh_ModInit() {
     }
     g_bCriticalSectionInitialized = TRUE;
 
+    // =============================================
+    // CRASH PROTECTION SAFETY NET
+    // Primary fix: WM_SIZE suppression in subclassed WndProc
+    // Fallback: Auto-hide hard error dialog if crash still occurs
+    // =============================================
+    g_hMonitorStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (g_hMonitorStopEvent) {
+        g_hDialogMonitorThread = CreateThread(NULL, 0, DialogMonitorThreadProc, NULL, 0, NULL);
+        if (!g_hDialogMonitorThread) {
+            Wh_Log(L"Crash Protection: WARNING - Failed to start dialog monitor thread (error: %lu)",
+                    GetLastError());
+            CloseHandle(g_hMonitorStopEvent);
+            g_hMonitorStopEvent = NULL;
+        }
+    } else {
+        Wh_Log(L"Crash Protection: WARNING - Failed to create stop event (error: %lu)",
+                GetLastError());
+    }
+
     // Set up all hooks BEFORE creating windows to prevent race conditions
     Wh_Log(L"Magnifier Headless: Setting up function hooks...");
 
@@ -885,6 +955,20 @@ void Wh_ModUninit() {
 
     // Mark as uninitialized (atomic operation)
     InterlockedExchange(&g_lInitialized, 0);
+
+    // Stop dialog monitor thread
+    if (g_hMonitorStopEvent) {
+        SetEvent(g_hMonitorStopEvent);
+    }
+    if (g_hDialogMonitorThread) {
+        WaitForSingleObject(g_hDialogMonitorThread, 3000);
+        CloseHandle(g_hDialogMonitorThread);
+        g_hDialogMonitorThread = NULL;
+    }
+    if (g_hMonitorStopEvent) {
+        CloseHandle(g_hMonitorStopEvent);
+        g_hMonitorStopEvent = NULL;
+    }
 
     // Unhook window procedure hook
     if (g_hCallWndProcHook) {
