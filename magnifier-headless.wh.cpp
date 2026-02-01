@@ -56,6 +56,7 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
   * Enforces hiding on `WM_WINDOWPOSCHANGED`
   * Blocks `WM_ACTIVATE` and `WM_NCACTIVATE` (activation prevention)
   * Suppresses `WM_PAINT` and `WM_ERASEBKGND` (no visual artifacts)
+  * Suppresses `WM_SIZE` (prevents KB5074105 stack buffer overflow crash)
   * Blocks `WM_SETFOCUS` (focus prevention)
   * Blocks `WM_MOUSEACTIVATE` (mouse activation prevention)
   * Blocks `WM_SYSCOMMAND` (SC_RESTORE, SC_MAXIMIZE prevention)
@@ -73,7 +74,7 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
 ## Performance Optimizations
 - Process ID fast-path filtering to skip non-Magnifier windows instantly
 - Inline IsMagnifierWindow with optimized string comparison (first character check)
-- High-frequency message suppression (WM_PAINT, WM_TIMER, WM_NCHITTEST)
+- High-frequency message suppression (WM_PAINT, WM_TIMER, WM_NCHITTEST, WM_SIZE)
 - Reduced atomic operation overhead (simple read instead of InterlockedCompareExchange)
 - LRU cache eviction for optimal memory usage
 - Conditional logging to minimize overhead
@@ -574,6 +575,7 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     case WM_SYNCPAINT:
     case WM_TIMER:
     case WM_NCHITTEST:
+    case WM_SIZE:  // Prevents KB5074105 stack buffer overflow crash
         // Silently ignore high-frequency messages
         return 0;
 
