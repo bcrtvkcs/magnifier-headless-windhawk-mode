@@ -1,5 +1,7 @@
 # Magnifier Headless Mode
 
+![Screenshot](https://i.imgur.com/m5w78pe.png)
+
 Blocks the Magnifier window creation, keeping zoom functionality with Win+"-" and Win+"+" keyboard shortcuts.
 
 ## Overview
