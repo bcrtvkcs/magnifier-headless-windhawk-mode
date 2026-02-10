@@ -19,7 +19,7 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 - **High Performance**: Optimized with LRU cache and fast-path filtering
 - **Comprehensive Coverage**: Hooks 11 Windows APIs for complete control
 
-**Improvements**:
+### **Improvements**:
 - Thread-safe implementation with CRITICAL_SECTION protection
 - 11 API hooks for complete window visibility control
 - Window procedure interception for message-level blocking
@@ -27,7 +27,7 @@ This Windhawk mod completely hides the Windows Magnifier UI while preserving ful
 - Process ID filtering for minimal overhead
 - Portable error handling with retry mechanisms
 
-**Compatibility**: Windows 10/11, magnify.exe only
+### **Compatibility**: Windows 10/11, magnify.exe only
 
 ## Installation
 
