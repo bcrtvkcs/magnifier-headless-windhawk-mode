@@ -2,7 +2,7 @@
 // @id              magnifier-headless
 // @name            Magnifier Headless Mode
 // @description     Blocks the Magnifier window creation, keeping zoom functionality with win+"-" and win+"+" keyboard shortcuts.
-// @version         0.9.6.2
+// @version         0.9.5.4
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
 // @twitter         https://x.com/bcrtvkcs
@@ -56,7 +56,6 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
   * Enforces hiding on `WM_WINDOWPOSCHANGED`
   * Blocks `WM_ACTIVATE` and `WM_NCACTIVATE` (activation prevention)
   * Suppresses `WM_PAINT` and `WM_ERASEBKGND` (no visual artifacts)
-  * Suppresses `WM_SIZE` (prevents KB5074105 stack buffer overflow crash)
   * Blocks `WM_SETFOCUS` (focus prevention)
   * Blocks `WM_MOUSEACTIVATE` (mouse activation prevention)
   * Blocks `WM_SYSCOMMAND` (SC_RESTORE, SC_MAXIMIZE prevention)
@@ -74,7 +73,7 @@ The mod hooks multiple Windows API functions to ensure complete coverage:
 ## Performance Optimizations
 - Process ID fast-path filtering to skip non-Magnifier windows instantly
 - Inline IsMagnifierWindow with optimized string comparison (first character check)
-- High-frequency message suppression (WM_PAINT, WM_TIMER, WM_NCHITTEST, WM_SIZE)
+- High-frequency message suppression (WM_PAINT, WM_TIMER, WM_NCHITTEST)
 - Reduced atomic operation overhead (simple read instead of InterlockedCompareExchange)
 - LRU cache eviction for optimal memory usage
 - Conditional logging to minimize overhead
@@ -520,7 +519,6 @@ LRESULT CALLBACK MagnifierWndProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     case WM_SYNCPAINT:
     case WM_TIMER:
     case WM_NCHITTEST:
-    case WM_SIZE:  // Prevents KB5074105 stack buffer overflow crash
         // Silently ignore high-frequency messages
         return 0;
 
@@ -704,19 +702,6 @@ HWND WINAPI CreateWindowExW_Hook(
         }
         Wh_Log(L"Magnifier Headless: Hid Magnifier Touch window from Alt+Tab (HWND: 0x%p)", hwnd);
     } else if (hwnd && isMagnifierClass) {
-        // CRITICAL: Subclass immediately to catch WM_SIZE before any operations
-        // This prevents the KB5074105 crash that occurs when WM_SIZE is handled
-        {
-            AutoCriticalSection lock(&g_csGlobalState);
-            if (g_hSubclassedMagnifierWnd != hwnd) {
-                BOOL result = WindhawkUtils::SetWindowSubclassFromAnyThread(hwnd, MagnifierWndProc_Hook, 0);
-                if (result) {
-                    g_hSubclassedMagnifierWnd = hwnd;
-                    Wh_Log(L"Magnifier Headless: Early subclass installed in CreateWindowExW (HWND: 0x%p)", hwnd);
-                }
-            }
-        }
-
         // For other magnifier windows: Hide completely
         // Fast path: Read g_hHostWnd without lock (it's stable after init)
         HWND hostWnd = g_hHostWnd;
