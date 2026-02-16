@@ -84,11 +84,7 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
         return ShowWindow_Original(hWnd, nCmdShow);
     }
 
-    if (IsTouchOverlayWindow(hWnd)) {
-        return ShowWindow_Original(hWnd, nCmdShow);
-    }
-
-    if (IsMagnifierWindow(hWnd) && nCmdShow != SW_HIDE) {
+    if ((IsMagnifierWindow(hWnd) || IsTouchOverlayWindow(hWnd)) && nCmdShow != SW_HIDE) {
         return TRUE;
     }
     return ShowWindow_Original(hWnd, nCmdShow);
@@ -102,9 +98,10 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y,
         return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
     }
 
-    // Move touch overlay off-screen with zero size
+    // Move touch overlay off-screen with zero size and force hidden
     if (IsTouchOverlayWindow(hWnd)) {
-        return SetWindowPos_Original(hWnd, hWndInsertAfter, -32000, -32000, 0, 0, uFlags);
+        return SetWindowPos_Original(hWnd, hWndInsertAfter, -32000, -32000, 0, 0,
+                                      uFlags | SWP_HIDEWINDOW);
     }
 
     if (IsMagnifierWindow(hWnd)) {
@@ -156,6 +153,7 @@ HWND WINAPI CreateWindowExW_Hook(
     // Check for touch overlay by window title
     if (lpWindowName && wcsstr(lpWindowName, L"Magnifier Touch") != NULL) {
         isTouchOverlay = TRUE;
+        dwStyle &= ~WS_VISIBLE;
         dwExStyle &= ~WS_EX_APPWINDOW;
         dwExStyle |= WS_EX_TOOLWINDOW;
         Wh_Log(L"Magnifier Headless: Detected Magnifier Touch window");
@@ -178,10 +176,13 @@ HWND WINAPI CreateWindowExW_Hook(
         dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 
     if (hwnd && isTouchOverlay) {
-        // Force off-screen position and zero size
+        // Force off-screen position, zero size, and hidden
         if (SetWindowPos_Original) {
             SetWindowPos_Original(hwnd, NULL, -32000, -32000, 0, 0,
                                   SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (ShowWindow_Original) {
+            ShowWindow_Original(hwnd, SW_HIDE);
         }
     } else if (hwnd && isMagnifierClass) {
         // Reparent to hidden host window and hide
