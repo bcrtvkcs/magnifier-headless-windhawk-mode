@@ -5,7 +5,7 @@
 // @version         1.0
 // @author          BCRTVKCS
 // @github          https://github.com/bcrtvkcs
-// @twitter         https://twitter.com/bcrtvkcs
+// @twitter         https://x.com/bcrtvkcs
 // @homepage        https://grdigital.pro
 // @include         magnify.exe
 // ==/WindhawkMod==
