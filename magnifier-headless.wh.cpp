@@ -259,22 +259,21 @@ BOOL Wh_ModInit() {
 
     g_bInitialized = TRUE;
 
-    // Hide any magnifier windows that already exist
-    EnumWindows(EnumWindowsProc_HideMagnifier, 0);
-
     Wh_Log(L"Magnifier Headless: Initialization complete");
     return TRUE;
 }
 
+// Called by Windhawk after all hooks are activated and original function
+// pointers are valid. Safe to call ShowWindow_Original here.
+void Wh_ModAfterInit() {
+    Wh_Log(L"Magnifier Headless: Hiding existing magnifier windows...");
+    EnumWindows(EnumWindowsProc_HideMagnifier, 0);
+}
+
 void Wh_ModUninit() {
-    Wh_Log(L"Magnifier Headless: Uninitializing...");
-
-    g_bInitialized = FALSE;
-
-    if (g_hHostWnd) {
-        DestroyWindow(g_hHostWnd);
-        g_hHostWnd = NULL;
-    }
-
-    Wh_Log(L"Magnifier Headless: Uninitialization complete");
+    Wh_Log(L"Magnifier Headless: Uninitializing - terminating process for clean state");
+    // Restoring state (unhiding windows, unregistering class, destroying the
+    // host window from the correct thread) is not feasible. Terminate so that
+    // magnify.exe can be restarted cleanly without the mod.
+    TerminateProcess(GetCurrentProcess(), 0);
 }
