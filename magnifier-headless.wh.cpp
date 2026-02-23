@@ -37,7 +37,7 @@ Hides the Windows Magnifier window while keeping zoom functionality fully workin
 
 ## Compatibility
 - Windows 10 and Windows 11
-- Targets magnify.exe only
+- Targets `magnify.exe` only
 */
 // ==/WindhawkModReadme==
 
