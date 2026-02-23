@@ -32,3 +32,7 @@ The Magnifier window will remain completely hidden while all functionality works
 
 - Windows 10 and Windows 11
 - Targets magnify.exe only
+
+## License
+
+All rights reserved. No license specified.
