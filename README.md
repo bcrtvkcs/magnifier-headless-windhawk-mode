@@ -15,9 +15,9 @@ A [Windhawk](https://windhawk.net/) mod that hides the Windows Magnifier window 
 ## Installation
 
 1. Install [Windhawk](https://windhawk.net/)
-2. Search for "IDM Completed Downloads Cleaner" in the mod browser
+2. Search for "Magnifier Headless Mode" in the mod browser
 3. Click Install
-4. You're all set!
+4. Launch Windows Magnifier (Win + Plus)
 
 ## Usage
 
