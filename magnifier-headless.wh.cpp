@@ -32,7 +32,7 @@ Hides the Windows Magnifier window while keeping zoom functionality fully workin
 
 ### Keyboard Shortcuts
 - Zoom in: `Win` + `Plus`
-- Zoom out:`Win` + `Minus`
+- Zoom out: `Win` + `Minus`
 - Exit Magnifier: `Win` + `Escape`
 
 ## Compatibility
