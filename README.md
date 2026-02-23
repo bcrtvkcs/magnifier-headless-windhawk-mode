@@ -23,7 +23,7 @@ A [Windhawk](https://windhawk.net/) mod that hides the Windows Magnifier window 
 
 Simply use the standard Windows Magnifier keyboard shortcuts:
 - Zoom in: `Win` + `Plus`
-- Zoom out:`Win` + `Minus`
+- Zoom out: `Win` + `Minus`
 - Exit Magnifier: `Win` + `Escape`
 
 The Magnifier window will remain completely hidden while all functionality works normally.
