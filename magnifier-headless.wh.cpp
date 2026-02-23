@@ -16,16 +16,13 @@
 
 ![Screenshot](https://i.imgur.com/m5w78pe.png)
 
-Hides the Windows Magnifier window while keeping zoom functionality fully
-working with Win + Plus and Win + Minus keyboard shortcuts.
+Hides the Windows Magnifier window while keeping zoom functionality fully working with Win + Plus and Win + Minus keyboard shortcuts.
 
 ## Features
 - Completely hides the Magnifier UI window
 - Removes the Magnifier icon from the taskbar and Alt+Tab
-- Fixes the 5-6 second mouse cursor freeze on Magnifier startup (a known
-  Windows bug caused by touch controls appearing, even on non-touch devices)
-- Hides Magnifier touch overlay controls (semi-transparent squares at screen
-  corners)
+- Fixes the 5-6 second mouse cursor freeze on Magnifier startup (a known Windows bug caused by touch controls appearing, even on non-touch devices)
+- Hides Magnifier touch overlay controls (semi-transparent squares at screen corners)
 - Zoom keyboard shortcuts continue to work normally
 
 ## Usage
