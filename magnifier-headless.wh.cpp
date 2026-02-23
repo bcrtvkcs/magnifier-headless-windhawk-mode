@@ -28,7 +28,6 @@ Hides the Windows Magnifier window while keeping zoom functionality fully workin
 ## Usage
 1. Install the mod in Windhawk
 2. Launch Windows Magnifier (Win + Plus)
-3. Use magnification as normal -- the UI window will not appear
 
 ### Keyboard Shortcuts
 - Zoom in: `Win` + `Plus`
