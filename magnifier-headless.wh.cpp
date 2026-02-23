@@ -31,9 +31,9 @@ Hides the Windows Magnifier window while keeping zoom functionality fully workin
 3. Use magnification as normal -- the UI window will not appear
 
 ### Keyboard Shortcuts
-- **Win + Plus**: Zoom in
-- **Win + Minus**: Zoom out
-- **Win + Esc**: Exit Magnifier
+- Zoom in: `Win` + `Plus`
+- Zoom out:`Win` + `Minus`
+- Exit Magnifier: `Win` + `Escape`
 
 ## Compatibility
 - Windows 10 and Windows 11
